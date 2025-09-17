@@ -188,7 +188,8 @@ export default function App() {
       if (!val) return null;
       const m = String(val).match(/^([\d.]+)\s*(mm|in|px)?$/i);
       if (!m) return null;
-      const v = parseFloat(m[1]); const u = (m[2] || 'px').toLowerCase();
+      const v = parseFloat(m[1]);
+      const u = (m[2] || 'px').toLowerCase();
       if (u === 'mm') return v;
       if (u === 'in') return v * 25.4;
       if (u === 'px') return (v / 96) * 25.4;
@@ -201,26 +202,20 @@ export default function App() {
     else {
       const hMm = toMm(svgEl.getAttribute('height'));
       if (hMm && vbH) mmPerUnit = hMm / vbH;
-      else mmPerUnit = 1; // fallback: treat 1 SVG unit as 1 mm
     }
 
     return { svgEl, minX, minY, vbW, vbH, mmPerUnit };
   }, [getSvgEl]);
 
   const mmToUnits = useCallback((ptMm) => {
-    const svgEl = getSvgEl(); if (!svgEl) return null;
-
-    const vb = svgEl.getAttribute('viewBox'); if (!vb) return null;
-    const [currentMinX, currentMinY, currentW, currentH] = vb.split(/\s+/).map(Number);
-
-    const geom = getSvgGeom(); if (!geom) return null;
-    const originalX = ptMm.x / geom.mmPerUnit + geom.minX;
-    const originalY = ptMm.y / geom.mmPerUnit + geom.minY;
-    const currentScale = geom.vbW / currentW;
-    const r = (1 / geom.mmPerUnit) * currentScale;
-
-    return { x: originalX, y: originalY, r };
-  }, [getSvgEl, getSvgGeom]);
+    const g = getSvgGeom(); if (!g) return null;
+    return {
+      x: ptMm.x / g.mmPerUnit + g.minX,
+      y: ptMm.y / g.mmPerUnit + g.minY,
+      r: 1 / g.mmPerUnit,
+      _vb: g
+    };
+  }, [getSvgGeom]);
 
   function ensureGroup(id) {
     const svgEl = getSvgEl(); if (!svgEl) return null;
@@ -235,6 +230,12 @@ export default function App() {
     return g;
   }
 
+  const inView = (u) => {
+    if (!u || !u._vb) return false;
+    const { minX, minY, vbW, vbH } = u._vb;
+    return u.x >= minX && u.x <= (minX + vbW) && u.y >= minY && u.y <= (minY + vbH);
+  }
+
   const drawCircle = (g, x, y, r, fill, stroke) => {
     const c1 = document.createElementNS(NS, "circle");
     c1.setAttribute("cx", x); c1.setAttribute("cy", y); c1.setAttribute("r", r * 1.2);
@@ -244,7 +245,7 @@ export default function App() {
     c2.setAttribute("fill", "none"); c2.setAttribute("stroke", stroke); c2.setAttribute("stroke-width", r * 0.25);
     g.appendChild(c2);
   };
-  
+
   const drawText = (g, x, y, text, size, fill = "#000", stroke = "#fff") => {
     const t = document.createElementNS(NS, "text");
     t.setAttribute("x", x); t.setAttribute("y", y);
@@ -259,18 +260,19 @@ export default function App() {
 
     if (homeMm) {
       const uh = mmToUnits(homeMm);
-      if (uh) {
+      if (inView(uh)) {
         drawCircle(gm, uh.x, uh.y, uh.r, "rgba(0,180,0,0.25)", "#0a0");
         drawText(gm, uh.x + uh.r * 1.6, uh.y - uh.r * 0.8, "HOME", uh.r * 1.3, "#0a0");
       }
     }
     if (selectedMm) {
-      const uf = mmToUnits(selectedMm);
-      if (uf) drawCircle(gm, uf.x, uf.y, uf.r, "rgba(255,0,0,0.25)", "#d00");
+      const u = mmToUnits(selectedMm);
+      if (inView(u)) drawCircle(gm, u.x, u.y, u.r, "rgba(255,0,0,0.25)", "#d00");
     }
+
     if (homeMm && selectedMm) {
       const uh = mmToUnits(homeMm), uf = mmToUnits(selectedMm);
-      if (uh && uf) {
+      if (inView(uh) && inView(uf)) {
         const line = document.createElementNS(NS, "line");
         line.setAttribute("x1", uh.x); line.setAttribute("y1", uh.y);
         line.setAttribute("x2", uf.x); line.setAttribute("y2", uf.y);
@@ -282,10 +284,10 @@ export default function App() {
       }
     }
 
-    const gf = ensureGroup("overlay-fids"); if (!gf) return;
+    const gf = ensureGroup("overlay-fids");
     fiducials.forEach(f => {
       if (!f.design) return;
-      const u = mmToUnits(f.design); if (!u) return;
+      const u = mmToUnits(f.design); if (!inView(u)) return;
       drawCircle(gf, u.x, u.y, u.r, hexToRgba(f.color, 0.20), f.color);
       drawText(gf, u.x + u.r * 1.2, u.y - u.r * 0.8, f.id, u.r * 1.1, f.color);
     });
@@ -304,9 +306,8 @@ export default function App() {
       poly.setAttribute("points", pts + " " + pts.split(" ")[0]);
       poly.setAttribute("fill", "none");
       poly.setAttribute("stroke", "#00c4ff");
-      const firstPoint = mmToUnits(board[0]);
-      const strokeWidth = firstPoint ? firstPoint.r * 0.25 : (1 / (getSvgGeom()?.mmPerUnit || 1)) * 0.25;
-      poly.setAttribute("stroke-width", strokeWidth);
+      const u0 = mmToUnits(board[0]);
+      poly.setAttribute("stroke-width", (u0 ? u0.r : 1 / (getSvgGeom()?.mmPerUnit || 1)) * 0.25);
       poly.setAttribute("stroke-dasharray", "6,6");
       grect.appendChild(poly);
     } else {
@@ -524,6 +525,9 @@ export default function App() {
           <div className="row">
             <button className="btn" onClick={() => exportAllGcodeZip("marlin")}>Export G-code (Marlin ZIP)</button>
             <button className="btn secondary" onClick={() => exportAllGcodeZip("grbl")}>Export G-code (GRBL ZIP)</button>
+            <button className="btn" onClick={() => exportAllGcodeZip("creality")}>
+              Export G-code (Creality FDM ZIP)
+            </button>
           </div>
         </div>
 
@@ -602,7 +606,14 @@ export default function App() {
 
         <div className="panels">
           <CameraPanel />
-          <LinearMovePanel />
+          <LinearMovePanel
+            homeDesign={homeMm}
+            focusDesign={selectedMm}
+            xf={xf}
+            applyXf={applyXf}
+            components={components}
+            axisLetter="A"
+          />
           <SerialPanel />
         </div>
       </main>

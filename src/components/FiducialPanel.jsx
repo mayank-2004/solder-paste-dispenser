@@ -1,19 +1,18 @@
-// src/components/FiducialPanel.jsx
 import React from "react";
 
 export default function FiducialPanel({
-  fiducials,           // [{id, design:{x,y}|null, machine:{x,y}|null, color}]
-  activeId,            // which F is armed for click/drag
+  fiducials,           
+  activeId,            
   setActiveId,
-  pickMode,            // true => viewer click/drag edits fiducials
+  pickMode,          
   togglePickMode,
-  onInputMachine,      // (id, partialXY)
-  onClearOne,          // (id)
+  onInputMachine,      
+  onClearOne,          
   onClearAll,
-  onSolve2,            // () => void
-  onSolve3,            // () => void
-  transformSummary,    // {type, thetaDeg?, scale?, tx, ty, rms?} | null
-  applyTransform,      // bool
+  onSolve2,            
+  onSolve3,            
+  transformSummary,    
+  applyTransform,      
   setApplyTransform
 }) {
   const ready2 = fiducials.filter(f => f.design && f.machine).length >= 2;

@@ -1,291 +1,309 @@
-import { useMemo, useState } from "react";
+import { useEffect, useRef, useMemo, useState, use } from "react";
+import { applyTransform } from "../lib/utils/transform2d";
+import "./LinearMovePanel.css";
 
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+export default function LinearMovePanel({
+  homeDesign,
+  focusDesign,
+  xf,
+  applyXf,
+  components = [],
+  axisLetter = "A"
+}) {
+  const toMachine = (pt) => {
+    if (!pt) return null;
+    return applyXf && xf ? applyTransform(xf, pt) : { ...pt };
+  };
+  const fmt = (n, d = 3) => (isFinite(n) ? n.toFixed(d) : "");
 
-function length2D(dx, dy) { return Math.hypot(dx, dy); }
-
-function axisLimitedLineSpeed({ dx, dy, Vx, Vy }) {
-  // unit direction
-  const L = Math.hypot(dx, dy) || 1;
-  const ux = dx / L, uy = dy / L;
-  // Per-axis limit ⇒ Vline * |u_axis| ≤ V_axis  ⇒ Vline ≤ V_axis / |u_axis|
-  const limitX = ux !== 0 ? Vx / Math.abs(ux) : Infinity;
-  const limitY = uy !== 0 ? Vy / Math.abs(uy) : Infinity;
-  return Math.min(limitX, limitY); // mm/s
-}
-
-function axisLimitedLineAccel({ dx, dy, Ax, Ay }) {
-  const L = Math.hypot(dx, dy) || 1;
-  const ux = dx / L, uy = dy / L;
-  const limitX = ux !== 0 ? Ax / Math.abs(ux) : Infinity;
-  const limitY = uy !== 0 ? Ay / Math.abs(uy) : Infinity;
-  return Math.min(limitX, limitY); // mm/s^2
-}
-
-/** Trapezoidal (with smooth per-segment ramp for jerk friendliness) */
-function makeTrapezoidSegments({ A, B, vmax, amax, segments = 60 }) {
-  const dx = B.x - A.x, dy = B.y - A.y;
-  const L = Math.hypot(dx, dy) || 0.0001;
-  const ux = dx / L, uy = dy / L;
-
-  // distance to accelerate to vmax: da = V^2/(2a)
-  const d_accel = (vmax * vmax) / (2 * amax);
-  const d_total_accel = 2 * d_accel;
-
-  let vPeak = vmax;
-  let d_acc = d_accel, d_cruise = L - d_total_accel, d_dec = d_accel;
-
-  if (d_cruise < 0) {
-    // triangular profile: cannot reach vmax
-    vPeak = Math.sqrt(amax * L);
-    d_acc = d_dec = L / 2;
-    d_cruise = 0;
-  }
-
-  // Build segments along 0..L; velocity ramp in/out
-  const pts = [];
-  const gc = [];
-
-  // Helper to get point at distance s along the line
-  const atS = (s) => ({ x: A.x + ux * s, y: A.y + uy * s });
-
-  let last = A;
-  for (let i = 1; i <= segments; i++) {
-    const s = (i / segments) * L;
-
-    // velocity envelope (scalar) across distance s
-    let v; // mm/s
-    if (s <= d_acc) {
-      // accelerate: v^2 = 2 * a * s  ⇒ v = sqrt(2as)
-      v = Math.sqrt(2 * amax * s);
-    } else if (s >= (L - d_dec)) {
-      const sDec = L - s;
-      v = Math.sqrt(2 * amax * sDec);
-    } else {
-      v = vPeak;
-    }
-
-    // Small smoothing of v for jerk-friendliness (optional micro ramp)
-    const smooth = 0.08; // 0..~0.15
-    const si = i / segments;
-    const sRampIn = clamp(si / smooth, 0, 1);
-    const sRampOut = clamp((1 - si) / smooth, 0, 1);
-    const ramp = Math.min(1, Math.min(sRampIn, sRampOut) + (1 - smooth));
-    const vSmooth = v * ramp;
-
-    const p = atS(s);
-    pts.push(p);
-
-    const dSeg = Math.hypot(p.x - last.x, p.y - last.y) || 0.0001;
-    const dt = dSeg / (vSmooth || 0.0001);
-    const F = vSmooth * 60; // mm/s → mm/min (G-code feed)
-    gc.push(`G1 X${p.x.toFixed(3)} Y${p.y.toFixed(3)} F${Math.max(1, F).toFixed(0)}`);
-    last = p;
-  }
-
-  const T = pts.length
-    ? pts.reduce((acc, p, i) => {
-        const q = i ? pts[i - 1] : A;
-        const d = Math.hypot(p.x - q.x, p.y - q.y);
-        const vline = Math.max(0.001, axisLimitedLineSpeed({ dx: p.x - q.x, dy: p.y - q.y, Vx: vmax, Vy: vmax }));
-        return acc + d / vline;
-      }, 0)
-    : 0;
-
-  return { pts, gc, stats: { Lxy: L, Vline: vPeak, Aline: amax, T } };
-}
-
-/** DDA-like “staircase” stepping along the line with a small grid size */
-function makeDDAPath({ A, B, step = 0.5, Vline }) {
-  const pts = [];
-  const gc = [];
-  const dx = B.x - A.x, dy = B.y - A.y;
-  const L = Math.hypot(dx, dy) || 0.0001;
-  const ux = dx / L, uy = dy / L;
-
-  const steps = Math.max(1, Math.ceil(L / step));
-  let last = A;
-  for (let i = 1; i <= steps; i++) {
-    const s = (i / steps) * L;
-    const x = A.x + ux * s;
-    const y = A.y + uy * s;
-    const px = Math.round(x / step) * step;
-    const py = Math.round(y / step) * step;
-    const p = { x: px, y: py };
-    pts.push(p);
-    const F = Math.max(60, (Vline * 60) | 0);
-    gc.push(`G1 X${p.x.toFixed(3)} Y${p.y.toFixed(3)} F${F}`);
-    last = p;
-  }
-  const T = L / Math.max(0.001, Vline);
-  return { pts, gc, stats: { Lxy: L, Vline, Aline: 0, T } };
-}
-
-/** Straight linear interpolation (single G1) */
-function makeLinearMove({ A, B, Vline }) {
-  const dx = B.x - A.x, dy = B.y - A.y;
-  const L = Math.hypot(dx, dy);
-  const F = Math.max(60, (Vline * 60) | 0);
-  const gc = [`G1 X${B.x.toFixed(3)} Y${B.y.toFixed(3)} F${F}`];
-  const pts = [A, B];
-  const T = L / Math.max(0.001, Vline);
-  return { pts, gc, stats: { Lxy: L, Vline, Aline: 0, T } };
-}
-
-/** Build complete pick→move→place sequence (no axis-sequential anywhere) */
-function buildPlacementSequence({ A, B, Zsafe, Zwork, axis, algo = "linear", ddaStep = 0.5 }) {
-  // Compute line-constrained limits
-  const dx = B.x - A.x, dy = B.y - A.y;
-  const VlineMax = axisLimitedLineSpeed({ dx, dy, Vx: axis.Vx, Vy: axis.Vy });
-  const AlineMax = axisLimitedLineAccel({ dx, dy, Ax: axis.Ax, Ay: axis.Ay });
-
-  // Z limits are independent
-  const Fz = Math.max(60, (axis.Vz * 60) | 0);
-
-  // Header / positioning
-  const g = [
-    "G21 ; mm",
-    "G90 ; absolute",
-    `G0 Z${Zsafe.toFixed(3)}`,
-    `G0 X${A.x.toFixed(3)} Y${A.y.toFixed(3)}`,
-    `G1 Z${Zwork.toFixed(3)} F${Fz} ; pick`,
-    `G1 Z${Zsafe.toFixed(3)} F${Fz}`
-  ];
-
-  // XY travel from A→B (choose algorithm)
-  let core;
-  if (algo === "linear") {
-    core = makeLinearMove({ A, B, Vline: VlineMax });
-  } else if (algo === "s-curve") {
-    core = makeTrapezoidSegments({ A, B, vmax: VlineMax, amax: Math.max(10, AlineMax) });
-  } else if (algo === "dda") {
-    const step = Math.max(0.05, ddaStep || 0.5);
-    core = makeDDAPath({ A, B, step, Vline: Math.min(VlineMax, 150) });
-  } else {
-    throw new Error("Unknown algo: " + algo);
-  }
-  g.push(...core.gc);
-
-  // Place at B
-  g.push(`G1 Z${Zwork.toFixed(3)} F${Fz} ; place`);
-  g.push(`G1 Z${Zsafe.toFixed(3)} F${Fz}`);
-
-  return { gcode: g, preview: core.pts, stats: core.stats };
-}
-
-/** -------- Small UI controls -------- **/
-function Num({ label, value, onChange, step = 0.1 }) {
-  return (
-    <label style={{ display: 'grid', gridTemplateColumns: '100px 1fr', gap: 8, alignItems: 'center', marginBottom: 6 }}>
-      <span>{label}</span>
-      <input type="number" value={value} step={step} onChange={e => onChange(Number(e.target.value))} />
-    </label>
-  );
-}
-
-/** -------- Panel -------- **/
-export default function LinearMovePanel() {
   const [A, setA] = useState({ x: 10, y: 20, z: 5 });
   const [B, setB] = useState({ x: 85, y: 40, z: 5 });
-  const [axis, setAxis] = useState({ Vx: 200, Vy: 150, Ax: 1500, Ay: 1200, Vz: 50, Az: 500 });
-  const [Zsafe, setZsafe] = useState(6);
-  const [Zwork, setZwork] = useState(0.4);
-  const [algo, setAlgo] = useState("linear"); // "linear" | "s-curve" | "dda"
+  const [zsafe, setZsafe] = useState(6);
+  const [zwork, setZwork] = useState(0.4);
+
+  const [Vx, setVx] = useState(200);
+  const [Vy, setVy] = useState(150);
+  const [Ax, setAx] = useState(1500);
+  const [Ay, setAy] = useState(1200);
+  const [Vz, setVz] = useState(50);
+  const [Az, setAz] = useState(500);
+
+  const [algo, setAlgo] = useState("linear");
   const [ddaStep, setDdaStep] = useState(0.5);
-  const [seq, setSeq] = useState({ gcode: [], preview: [], stats: null });
+  const [rotDeg, setRotDeg] = useState(0);
 
-  const plan = () => setSeq(buildPlacementSequence({ A, B, Zsafe, Zwork, axis, algo, ddaStep }));
+  const [previewPts, setPreviewPts] = useState([])
+  const [gcode, setGcode] = useState("");
+  const svgRef = useRef(null);
 
-  const send = async () => {
-    const out = seq.gcode?.length ? seq : buildPlacementSequence({ A, B, Zsafe, Zwork, axis, algo, ddaStep });
-    await window.serial.sendGcode(out.gcode.join('\n'));
-    setSeq(out);
-  };
+  const useHomeForA = () => homeDesign && setA((s) => ({ ...s, ...toMachine(homeDesign) }))
+  const useFocusForB = () => focusDesign && setB((s) => ({ ...s, ...toMachine(focusDesign) }))
+  const useHomeForB = () => homeDesign && setB((s) => ({ ...s, ...toMachine(homeDesign) }))
+  const useFocusForA = () => focusDesign && setA((s) => ({ ...s, ...toMachine(focusDesign) }))
+  const swapAb = () => {
+    setA(B);
+    setB(A);
+  }
+  useEffect(() => {
+    if (homeDesign) setA((s) => ({ ...s, ...toMachine(homeDesign) }));
+    if (focusDesign) setB((s) => ({ ...s, ...toMachine(focusDesign) }));
+  }, [homeDesign, focusDesign, applyXf, xf]);
 
-  const poly = useMemo(() => {
-    if (!seq.preview?.length) return '';
-    const pts = seq.preview.map(p => `${p.x},${p.y}`).join(' ');
+  function capLineSpeed(dirx, diry) {
+    const ux = Math.abs(dirx) < 1e-9 ? 1e-9 : Math.abs(dirx);
+    const uy = Math.abs(diry) < 1e-9 ? 1e-9 : Math.abs(diry);
+    const vmax = Math.min(Vx / ux, Vy / uy);
+    const amax = Math.min(Ax / ux, Ay / uy);
+    return { vmax, amax };
+  }
+
+  function planSegments(a, b) {
+    const pts = [];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const L = Math.hypot(dx, dy);
+    if (L < 1e-6) {
+      return [{ x: b.x, y: b.y }];
+    }
+    const ux = dx / L, uy = dy / L;
+    const { vmax } = capLineSpeed(ux, uy);
+
+    if (algo === "linear") {
+      pts.push({ x: b.x, y: b.y, feed: vmax * 60 });
+    } else if (algo === "axis") {
+      const xm = { x: b.x, y: a.y };
+      const dx1 = xm.x - a.x, dy1 = xm.y - a.y;
+      const L1 = Math.hypot(dx1, dy1) || 1;
+      const ux1 = dx1 / L1, uy1 = dy1 / L1;
+      const { vmax: v1 } = capLineSpeed(ux1, uy1);
+
+      const dx2 = b.x - xm.x, dy2 = b.y - xm.y;
+      const L2 = Math.hypot(dx2, dy2) || 1;
+      const ux2 = dx2 / L2, uy2 = dy2 / L2;
+      const { vmax: v2 } = capLineSpeed(ux2, uy2);
+
+      pts.push({ x: xm.x, y: xm.y, feed: v1 * 60 });
+      pts.push({ x: b.x, y: b.y, feed: v2 * 60 });
+    } else if (algo === "dda") {
+      const step = Math.max(0.05, ddaStep);
+      const n = Math.ceil(L / step);
+      for (let i = 1; i <= n; i++) {
+        const t = i / n;
+        pts.push({ x: a.x + dx * t, y: a.y + dy * t, feed: (vmax * 60) });
+      }
+    } else {
+      pts.push({ x: b.x, y: b.y, feed: Math.min(Vx, Vy) * 60 });
+    }
     return pts;
-  }, [seq.preview]);
+  }
+
+  function buildGcode(a, b, segs) {
+    const g = [];
+    g.push("; --- linearMovePanel (machine mm) ---");
+    g.push("G21");
+    g.push("G90");
+    g.push(`G0 Z${fmt(Math.max(zsafe, a.z ?? zsafe))}`);
+    g.push(`G0 X${fmt(a.x)} Y${fmt(a.y)}`);
+    g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
+    g.push("; pick");
+    g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
+
+    for (const p of segs) g.push(`G1 X${fmt(p.x)} Y${fmt(p.y)} F${fmt(p.feed, 0)}`);
+    if (isFinite(rotDeg) && rotDeg !== 0) g.push(`G0 ${axisLetter}${fmt(rotDeg, 2)}`);
+
+    g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
+    g.push("; place");
+    g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
+
+    return g.join("\n");
+  }
+
+  function plan() {
+    const a = { ...A }, b = { ...B };
+    const segs = planSegments(a, b);
+    setPreviewPts([{ x: a.x, y: a.y }, ...segs.map(s => ({ x: s.x, y: s.y }))]);
+    setGcode(buildGcode(a, b, segs));
+  }
+
+  async function send() {
+    if (!gcode) plan();
+    const lines = (gcode || "").split("\n").filter(Boolean);
+
+    const sendLine = async (ln) => {
+      if (window?.electronSerial?.writeLine) return window.electronSerial.writeLine(ln + "\n");
+      if (window?.serial?.writeLine) return window.serial.writeLine(ln + "\n");
+      console.log(ln);
+    };
+    for (const ln of lines) await sendLine(ln);
+    if (!window?.electronSerial?.writeLine && !window?.serial?.writeLine) {
+      alert("No serail connection detected. G-code printed to console.");
+    }
+  }
+
+  function flattenPads() {
+    const out = [];
+    components.forEach((c) => (c.pads || []).forEach((p) => out.push({ x: p.x, y: p.y })));
+    return out;
+  }
+
+  function exportJob() {
+    const pads = flattenPads();
+    if (!pads.length) return alert("No pads found in the top paste layer.");
+
+    const ptA = toMachine(homeDesign) || toMachine(pads[0]);
+    if (!ptA) return alert("No HOME and no pads to start from.");
+
+    const feedXY = Math.min(Vx, Vy) * 60;
+    const g = [];
+    g.push("; --- Pad dispensing job (machine mm) ---");
+    g.push("G21");
+    g.push("G90");
+    g.push(`G0 Z${fmt(zsafe)}`);
+    g.push(`G0 X${fmt(ptA.x)} Y${fmt(ptA.y)}`);
+
+    for (const dPad of pads) {
+      const mPad = toMachine(dPad);
+      if (!mPad) continue;
+      g.push(`G1 X${fmt(mPad.x)} Y${fmt(mPad.y)} F${fmt(feedXY, 0)}`);
+      if (isFinite(rotDeg) && rotDeg !== 0) g.push(`G0 ${axisLetter}${fmt(rotDeg, 2)}`);
+      g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
+      g.push("; dispense");
+      g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
+    }
+
+    const blob = new Blob([g.join("\n") + "\n"], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "dispense_job.gcode";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  const bbox = useMemo(() => {
+    const pts = previewPts.length ? previewPts : [A, B];
+    const minX = Math.min(...pts.map(p => p.x));
+    const maxX = Math.max(...pts.map(p => p.x));
+    const minY = Math.min(...pts.map(p => p.y));
+    const maxY = Math.max(...pts.map(p => p.y));
+    return { minX, minY, maxY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY) };
+  }, [previewPts, A, B]);
+
+  function project(p) {
+    const pad = 10;
+    const W = 220, H = 180;
+    const sx = (W - pad * 2) / bbox.w;
+    const sy = (H - pad * 2) / bbox.h;
+    const s = Math.min(sx, sy);
+    const x = pad + (p.x - bbox.minX) * s;
+    const y = pad + (bbox.maxY - p.y) * s;
+    return { x, y };
+  }
 
   return (
-    <div className="panel" style={{ background: '#0b0b0b', color: '#eee', border: '1px solid #222', width:'1000px', borderRadius: 8, padding: 10 }}>
-      <h4 style={{ margin: '0 0 8px' }}>Pick → Place Planner (XY only, no axis-sequential)</h4>
+    <div className="panel linear-panel">
+      <h3>Pick → Place Planner (XY + Zsafe/Zwork)</h3>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
-        <fieldset>
+      <div className="row wrap" style={{ gap: 12 }}>
+        <fieldset className="box">
           <legend>A (mm)</legend>
-          <Num label="Ax" value={A.x} onChange={v => setA({ ...A, x: v })} />
-          <Num label="Ay" value={A.y} onChange={v => setA({ ...A, y: v })} />
-          <Num label="Az" value={A.z} onChange={v => setA({ ...A, z: v })} />
+          <div className="grid2">
+            <label>Ax <input type="number" value={A.x} onChange={e => setA({ ...A, x: +e.target.value })} /></label>
+            <label>Ay <input type="number" value={A.y} onChange={e => setA({ ...A, y: +e.target.value })} /></label>
+          </div>
+          <label>Az <input type="number" value={A.z} onChange={e => setA({ ...A, z: +e.target.value })} /></label>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn sm" onClick={useHomeForA}>Use HOME</button>
+            <button className="btn sm" onClick={useFocusForA}>Use Focus</button>
+          </div>
         </fieldset>
-        <fieldset>
+
+        <fieldset className="box">
           <legend>B (mm)</legend>
-          <Num label="Bx" value={B.x} onChange={v => setB({ ...B, x: v })} />
-          <Num label="By" value={B.y} onChange={v => setB({ ...B, y: v })} />
-          <Num label="Bz" value={B.z} onChange={v => setB({ ...B, z: v })} />
+          <div className="grid2">
+            <label>Bx <input type="number" value={B.x} onChange={e => setB({ ...B, x: +e.target.value })} /></label>
+            <label>By <input type="number" value={B.y} onChange={e => setB({ ...B, y: +e.target.value })} /></label>
+          </div>
+          <label>Bz <input type="number" value={B.z} onChange={e => setB({ ...B, z: +e.target.value })} /></label>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn sm" onClick={useFocusForB}>Use Focus</button>
+            <button className="btn sm" onClick={useHomeForB}>Use HOME</button>
+          </div>
         </fieldset>
-        <fieldset>
+
+        <fieldset className="box faint">
           <legend>Limits</legend>
-          <Num label="Vx (mm/s)" value={axis.Vx} onChange={v => setAxis({ ...axis, Vx: v })} />
-          <Num label="Vy (mm/s)" value={axis.Vy} onChange={v => setAxis({ ...axis, Vy: v })} />
-          <Num label="Ax (mm/s²)" value={axis.Ax} onChange={v => setAxis({ ...axis, Ax: v })} />
-          <Num label="Ay (mm/s²)" value={axis.Ay} onChange={v => setAxis({ ...axis, Ay: v })} />
-          <Num label="Vz (mm/s)" value={axis.Vz} onChange={v => setAxis({ ...axis, Vz: v })} />
-          <Num label="Az (mm/s²)" value={axis.Az} onChange={v => setAxis({ ...axis, Az: v })} />
+          <div className="grid2">
+            <label>Vx (mm/s) <input type="number" value={Vx} onChange={e => setVx(+e.target.value)} /></label>
+            <label>Vy (mm/s) <input type="number" value={Vy} onChange={e => setVy(+e.target.value)} /></label>
+            <label>Ax (mm/s²) <input type="number" value={Ax} onChange={e => setAx(+e.target.value)} /></label>
+            <label>Ay (mm/s²) <input type="number" value={Ay} onChange={e => setAy(+e.target.value)} /></label>
+            <label>Vz (mm/s) <input type="number" value={Vz} onChange={e => setVz(+e.target.value)} /></label>
+            <label>Az (mm/s²) <input type="number" value={Az} onChange={e => setAz(+e.target.value)} /></label>
+          </div>
         </fieldset>
       </div>
 
-      <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', marginTop: 8 }}>
-        <Num label="Zsafe" value={Zsafe} onChange={setZsafe} />
-        <Num label="Zwork" value={Zwork} onChange={setZwork} />
-        <div>
-          <div style={{ fontSize: 12, marginBottom: 4 }}>Algorithm</div>
-          <label style={{ marginRight: 12 }}>
-            <input type="radio" checked={algo === "linear"} onChange={() => setAlgo("linear")} /> Linear (diagonal)
-          </label>
-          <label style={{ marginRight: 12 }}>
-            <input type="radio" checked={algo === "s-curve"} onChange={() => setAlgo("s-curve")} /> Blended (S-curve)
-          </label>
-          <label>
-            <input type="radio" checked={algo === "dda"} onChange={() => setAlgo("dda")} /> DDA staircase
-          </label>
-        </div>
-        {algo === "dda" && <Num label="DDA step (mm)" value={ddaStep} step={0.05} onChange={setDdaStep} />}
-        <button onClick={plan}>Plan</button>
-        <button onClick={send}>Send</button>
+      <div className="row wrap" style={{ gap: 12 }}>
+        <fieldset className="box">
+          <legend>Heights</legend>
+          <div className="grid2">
+            <label>Zsafe <input type="number" step="0.1" value={zsafe} onChange={e => setZsafe(+e.target.value)} /></label>
+            <label>Zwork <input type="number" step="0.05" value={zwork} onChange={e => setZwork(+e.target.value)} /></label>
+          </div>
+        </fieldset>
+
+        <fieldset className="box">
+          <legend>Algorithm</legend>
+          <select value={algo} onChange={e => setAlgo(e.target.value)}>
+            <option value="linear">Linear (diagonal)</option>
+            <option value="axis">Axis-sequential (X → Y)</option>
+            <option value="blended">Blended (S-curve approx)</option>
+            <option value="dda">DDA staircase</option>
+          </select>
+        </fieldset>
+
+        <fieldset className="box">
+          <legend>Rotation</legend>
+          <label>{axisLetter} (deg) <input type="number" step="0.1" value={rotDeg} onChange={e => setRotDeg(+e.target.value)} /></label>
+        </fieldset>
       </div>
 
-      <div style={{ marginTop: 10, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-        <div style={{ background: '#111', border: '1px solid #222', borderRadius: 8, padding: 8 }}>
-          <div style={{ fontSize: 12, marginBottom: 6 }}>Preview (XY)</div>
-          <svg viewBox="0 0 120 80" style={{ width: '100%', height: 260, background: '#0b0b0b', borderRadius: 6 }}>
-            <line x1="0" y1="79" x2="120" y2="79" stroke="#333" />
-            <line x1="1" y1="0" x2="1" y2="80" stroke="#333" />
-            {poly && <polyline points={poly} fill="none" stroke="#4cc9f0" strokeWidth="0.6" />}
-            <circle cx={A.x} cy={A.y} r="1.2" fill="#90ee90" />
-            <circle cx={B.x} cy={B.y} r="1.2" fill="#ff6b6b" />
+      <div className="row" style={{ gap: 8 }}>
+        <button className="btn" onClick={plan}>Plan</button>
+        <button className="btn" onClick={send}>Send</button>
+        <button className="btn secondary" onClick={exportJob} disabled={!components?.length}>Export Job (all pads)</button>
+      </div>
+
+      <div className="row wrap" style={{ gap: 16, marginTop: 12 }}>
+        <div className="box" style={{ width: 240 }}>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>Preview (XY)</div>
+          <svg ref={svgRef} width="220" height="180">
+            <rect x="0" y="0" width="220" height="180" rx="8" ry="8" fill="#0b0b0b" />
+            {/* axes */}
+            <line x1="10" y1="170" x2="210" y2="170" stroke="#333" />
+            <line x1="10" y1="10" x2="10" y2="170" stroke="#333" />
+            {/* A */}
+            <circle cx={project(A).x} cy={project(A).y} r="3.5" fill="#4ade80" />
+            {/* path */}
+            {previewPts.length > 1 && (
+              <polyline
+                fill="none"
+                stroke="#ffd400"
+                strokeWidth="2"
+                points={previewPts.map(p => {
+                  const q = project(p); return `${q.x},${q.y}`;
+                }).join(" ")} />
+            )}
+            {/* B */}
+            <circle cx={project(B).x} cy={project(B).y} r="3.5" fill="#ef4444" />
           </svg>
         </div>
 
-        <div style={{ background: '#111', border: '1px solid #222', borderRadius: 8, padding: 8, fontSize: 14 }}>
-          <div><b>Stats</b></div>
-          {seq.stats ? (
-            <ul style={{ lineHeight: 1.6 }}>
-              <li>Lxy: {seq.stats.Lxy.toFixed(3)} mm</li>
-              <li>Projected Vline: {seq.stats.Vline.toFixed(2)} mm/s</li>
-              <li>Projected Aline: {seq.stats.Aline.toFixed(2)} mm/s²</li>
-              <li>Estimated T: {seq.stats.T.toFixed(3)} s</li>
-            </ul>
-          ) : <div>Plan to see stats…</div>}
-          <div style={{ marginTop: 8 }}>
-            <b>G-code</b>
-            <pre style={{ background: '#0b0b0b', padding: 8, borderRadius: 6, maxHeight: 220, overflow: 'auto' }}>
-              {(seq.gcode || []).join('\n')}
-            </pre>
-          </div>
+        <div className="box" style={{ flex: 1, minWidth: 260 }}>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>G-code</div>
+          <pre style={{ maxHeight: 220, overflow: "auto", margin: 0 }}>{gcode}</pre>
         </div>
       </div>
     </div>
-  );
+  )
 }

@@ -1,17 +1,34 @@
 export function convertGerberToGcode(gerberText, opts = {}) {
   const cfg = {
-    flavor: 'grbl',  
+    flavor: 'grbl',          // 'grbl' | 'marlin' | 'creality'
     units: 'auto',
+
     // GRBL:
-    travelZ: 3.0, workZ: -0.02, feedXY: 600, feedZ: 300, toolOn: 'M3', toolOff: 'M5',
-    // Marlin (viewer/paste):
-    layerZ: 0.2, ePerMm: 0.04,
+    travelZ: 3.0,
+    workZ: -0.02,
+    feedXY: 600,
+    feedZ: 300,
+    toolOn: 'M3',
+    toolOff: 'M5',
+
+    // Marlin (simple viewer/paste):
+    layerZ: 0.2,
+    ePerMm: 0.04,
+
+    // Creality/Cura-friendly FDM (viewer):
+    crealityZ: 0.2,          // layer height we "draw" at
+    crealityTravelZ: 0.8,    // lift for travels
+    crealityFeedXY: 1500,    // mm/min
+    crealityFeedZ: 600,      // mm/min
+    crealityEPerMm: 0.05,    // fake extrusion so the viewer shows the path
+
     ...opts
   };
 
-  const fmt = (n, dp = 4) => Number(n).toFixed(dp);
+  const fmt = (n, d = 3) => (isFinite(n) ? Number(n).toFixed(d) : "0");
   const IN2MM = 25.4;
 
+  // --- Parse parameter blocks first (as in your original)
   const paramBlocks = [];
   gerberText.replace(/%[^%]*%/g, (m) => { paramBlocks.push(m); return ''; });
 
@@ -26,12 +43,15 @@ export function convertGerberToGcode(gerberText, opts = {}) {
     if (fs) { zeroSupp = fs[1].toUpperCase(); xInt=+fs[3]; xDec=+fs[4]; yInt=+fs[5]; yDec=+fs[6]; }
   }
 
+  // Ops (D-codes etc.)
   const opsText = gerberText.replace(/%[^%]*%/g, '');
   const tokens = opsText.split('*').map(s => s.trim()).filter(Boolean);
 
+  // Final working units for output
   let units = (cfg.units === 'auto') ? fileUnits : cfg.units;
-  let curX = 0, curY = 0, currentD = null, interp = 'G01';
 
+  // State shared by all flavors
+  let curX = 0, curY = 0, currentD = null, interp = 'G01';
   const parseCoord = (val, i, d, z = zeroSupp) => {
     if (val.includes('.')) return parseFloat(val);
     let sign = 1;
@@ -52,13 +72,149 @@ export function convertGerberToGcode(gerberText, opts = {}) {
     return { x, y, i, j };
   };
 
-  // ---------- MARLIN flavor ----------
+  // Helpers to get mm
+  const mmX = (x) => units === 'in' ? x * IN2MM : x;
+  const mmY = (y) => units === 'in' ? y * IN2MM : y;
+  const dmm = (x0,y0,x1,y1) => Math.hypot(mmX(x1)-mmX(x0), mmY(y1)-mmY(y0));
+
+  // ============================================================
+  // NEW: Creality/Cura-friendly FDM flavor (for Creality Print)
+  // Builds simple polylines from D01 draws and emits an FDM file
+  // with E extrusion so the slicer viewer accepts it.
+  // ============================================================
+  if (cfg.flavor === 'creality') {
+    // Build polylines from Gerber draw ops (D01). D02 breaks polyline.
+    const polylines = [];
+    let current = [];
+    let last = { x: curX, y: curY };
+
+    const pushPoint = (px, py) => {
+      const X = mmX(px), Y = mmY(py);
+      if (!current.length) current.push({ x: X, y: Y });
+      current.push({ x: X, y: Y });
+    };
+    const breakPolyline = () => {
+      if (current.length > 1) polylines.push(current);
+      current = [];
+    };
+
+    for (let raw of tokens) {
+      const t = raw.replace(/\s+/g,''); if (!t || /^G0?4/i.test(t)) continue;
+      if (/^G70$/i.test(t)) { units='in'; continue; }
+      if (/^G71$/i.test(t)) { units='mm'; continue; }
+      if (/^G0?1$/i.test(t)) { interp='G01'; continue; }
+      if (/^G0?2$/i.test(t)) { interp='G02'; continue; }
+      if (/^G0?3$/i.test(t)) { interp='G03'; continue; }
+
+      const md = t.match(/D0?([123])$/i);
+      if (md) currentD = +md[1];
+
+      if (/[XY]/i.test(t)) {
+        const { x, y } = parseXYIJ(t, last);
+        if (currentD === 2 || currentD == null) {
+          // rapid move: break polyline and move
+          breakPolyline();
+          last = { x, y };
+          continue;
+        }
+        if (currentD === 1) {
+          // draw: add a segment to polyline
+          pushPoint(last.x, last.y);
+          pushPoint(x, y);
+          last = { x, y };
+          continue;
+        }
+        if (currentD === 3) {
+          // flash: make a tiny "tick" so viewer shows something
+          breakPolyline();
+          const X = mmX(x), Y = mmY(y);
+          polylines.push([{ x: X, y: Y }, { x: X + 0.2, y: Y }]);
+          last = { x, y };
+          continue;
+        }
+      }
+    }
+    breakPolyline();
+
+    // Header compatible with Cura/Creality viewers
+    const crealityHeader = (bounds) => {
+      const { minX, minY, maxX, maxY, z = cfg.crealityZ } = bounds || {};
+      return [
+        ";FLAVOR:Marlin",
+        ";Generated with pcb-offline (gerber→gcode creality flavor)",
+        ";TIME:1",
+        ";Filament used: 0.0001m",
+        ";Layer height: 0.2",
+        `;MINX:${fmt(minX ?? 0, 2)}`,
+        `;MINY:${fmt(minY ?? 0, 2)}`,
+        `;MINZ:${fmt(z, 2)}`,
+        `;MAXX:${fmt(maxX ?? 100, 2)}`,
+        `;MAXY:${fmt(maxY ?? 100, 2)}`,
+        `;MAXZ:${fmt(z, 2)}`,
+        "M140 S0",
+        "M105",
+        "M190 S0",
+        "M104 S0",
+        "M109 S0",
+        "G21",
+        "G90",
+        "M82",
+        "G92 E0",
+        ";LAYER_COUNT:1",
+        ";LAYER:0",
+      ].join("\n");
+    };
+
+    // Compute bounds for header
+    let minXb=Infinity, minYb=Infinity, maxXb=-Infinity, maxYb=-Infinity;
+    for (const poly of polylines) {
+      for (const p of poly) {
+        if (p.x < minXb) minXb = p.x;
+        if (p.x > maxXb) maxXb = p.x;
+        if (p.y < minYb) minYb = p.y;
+        if (p.y > maxYb) maxYb = p.y;
+      }
+    }
+    if (!isFinite(minXb)) { minXb=0; minYb=0; maxXb=100; maxYb=100; }
+
+    const g = [];
+    g.push(crealityHeader({ minX: minXb, minY: minYb, maxX: maxXb, maxY: maxYb, z: cfg.crealityZ }));
+    g.push(`G0 Z${fmt(cfg.crealityTravelZ)} F${fmt(cfg.crealityFeedZ,0)}`);
+    g.push("G92 E0");
+
+    let E = 0;
+    for (const poly of polylines) {
+      if (poly.length < 2) continue;
+      const s = poly[0];
+      // travel to start (no extrusion)
+      g.push(`G0 X${fmt(s.x)} Y${fmt(s.y)} F${fmt(cfg.crealityFeedXY,0)}`);
+      g.push(`G1 Z${fmt(cfg.crealityZ)} F${fmt(cfg.crealityFeedZ,0)}`);
+
+      for (let i = 1; i < poly.length; i++) {
+        const a = poly[i - 1], b = poly[i];
+        const L = Math.hypot(b.x - a.x, b.y - a.y);
+        E += L * (cfg.crealityEPerMm || 0.05);
+        g.push(`G1 X${fmt(b.x)} Y${fmt(b.y)} E${fmt(E,5)} F${fmt(cfg.crealityFeedXY,0)}`);
+      }
+      // lift for travel to next polyline
+      g.push(`G1 Z${fmt(cfg.crealityTravelZ)} F${fmt(cfg.crealityFeedZ,0)}`);
+    }
+    // End
+    g.push("M104 S0");
+    g.push("M140 S0");
+    g.push("M107");
+    g.push("G92 E0");
+    g.push("M84");
+
+    return g.join("\n") + "\n";
+  }
+
+  // ============================================================
+  // MARLIN flavor (your previous simple viewer/paste path)
+  // ============================================================
   if (cfg.flavor === 'marlin') {
     const out = [];
     let E = 0;
-    const mmX = (x) => units === 'in' ? x * IN2MM : x;
-    const mmY = (y) => units === 'in' ? y * IN2MM : y;
-    const dmm = (x0,y0,x1,y1) => Math.hypot(mmX(x1)-mmX(x0), mmY(y1)-mmY(y0));
 
     out.push(`;FLAVOR:Marlin`);
     out.push(`G90`); out.push(`G21`); out.push(`M82`); out.push(`G92 E0`);
@@ -97,7 +253,9 @@ export function convertGerberToGcode(gerberText, opts = {}) {
     return out.join('\n');
   }
 
-  // ---------- GRBL flavor ----------
+  // ============================================================
+  // GRBL flavor (your original CNC output)
+  // ============================================================
   const out = [];
   const push = (s) => out.push(s);
   push(units === 'in' ? 'G20' : 'G21');
@@ -107,9 +265,9 @@ export function convertGerberToGcode(gerberText, opts = {}) {
   const toolOff = () => push(cfg.toolOff);
   const plunge  = () => push(`G1 Z${fmt(cfg.workZ,3)} F${fmt(cfg.feedZ,2)}`);
   const retract = () => push(`G0 Z${fmt(cfg.travelZ,3)}`);
-  const rapidXY = (x,y) => push(`G0 X${fmt(x)} Y${fmt(y)}`);
-  const lineXY  = (x,y) => push(`G1 X${fmt(x)} Y${fmt(y)}`);
-  const arcXYIJ = (code, x, y, i, j) => push(`${code} X${fmt(x)} Y${fmt(y)} I${fmt(i)} J${fmt(j)}`);
+  const rapidXY = (x,y) => push(`G0 X${fmt(units==='in'?x*IN2MM:x)} Y${fmt(units==='in'?y*IN2MM:y)}`);
+  const lineXY  = (x,y) => push(`G1 X${fmt(units==='in'?x*IN2MM:x)} Y${fmt(units==='in'?y*IN2MM:y)}`);
+  const arcXYIJ = (code, x, y, i, j) => push(`${code} X${fmt(units==='in'?x*IN2MM:x)} Y${fmt(units==='in'?y*IN2MM:y)} I${fmt(units==='in'?i*IN2MM:i)} J${fmt(units==='in'?j*IN2MM:j)}`);
 
   for (let raw of tokens) {
     const t = raw.replace(/\s+/g,''); if (!t || /^G0?4/i.test(t)) continue;
