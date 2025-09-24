@@ -1,42 +1,46 @@
-import { useEffect, useRef, useState } from "react";
+// src/components/CameraPanel.jsx
+import React from 'react';
 
 export default function CameraPanel() {
-  const videoRef = useRef(null);
-  const [devices, setDevices] = useState([]);
-  const [deviceId, setDeviceId] = useState('');
+  const videoRef = React.useRef(null);
+  const [status, setStatus] = React.useState('');
 
-  useEffect(() => {
+  React.useEffect(() => {
+    let stream;
     (async () => {
-      const list = await navigator.mediaDevices.enumerateDevices();
-      setDevices(list.filter(d => d.kind === 'videoinput'));
+      try {
+        setStatus('Opening camera…');
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        const v = videoRef.current;
+        if (v) {
+          v.srcObject = stream;
+          await v.play();
+          setStatus('');
+        } else {
+          setStatus('Video element not ready');
+        }
+      } catch (e) {
+        console.error('Camera error', e);
+        setStatus(`Camera error: ${e.message}`);
+      }
     })();
+
+    return () => {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+    };
   }, []);
 
-  const start = async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: deviceId ? { deviceId: { exact: deviceId } } : true
-    });
-    videoRef.current.srcObject = stream;
-    await videoRef.current.play();
-  };
-  const stop = () => {
-    const s = videoRef.current?.srcObject;
-    s?.getTracks().forEach(t => t.stop());
-    if (videoRef.current) videoRef.current.srcObject = null;
-  };
-
   return (
-    <div className="card">
-      <h3>Camera</h3>
-      <div className="row">
-        <select value={deviceId} onChange={e=>setDeviceId(e.target.value)}>
-          <option value="">Default camera</option>
-          {devices.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || d.deviceId}</option>)}
-        </select>
-        <button className="btn" onClick={start}>Start</button>
-        <button className="btn secondary" onClick={stop}>Stop</button>
-      </div>
-      <video ref={videoRef} style={{width:"100%", borderRadius:8}} />
+    <div className="panel">
+      <h3 className="h">Camera</h3>
+      {status && <div style={{marginBottom:8}}><span className="badge">{status}</span></div>}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        style={{ width: '100%', height: 360, background: '#000', borderRadius: 12 }}
+      />
     </div>
   );
 }
