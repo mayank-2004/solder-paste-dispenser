@@ -1058,7 +1058,7 @@ export default function ImportPanel() {
             )}
 
             {/* Layer Type Information */}
-            <div className="mt-6 bg-gray-50 rounded-lg p-4">
+            {/* <div className="mt-6 bg-gray-50 rounded-lg p-4">
                 <h3 className="font-semibold mb-3">Layer Type Information</h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 text-sm">
                     <div className="bg-white p-3 rounded border">
@@ -1078,7 +1078,7 @@ export default function ImportPanel() {
                         <div className="text-gray-600">Cutting operations for board shape</div>
                     </div>
                 </div>
-            </div>
+            </div> */}
         </div>
     );
 }

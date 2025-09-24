@@ -11,7 +11,7 @@ export function buildPasteJob({ parts, pads = [], cfg, transform }) {
         const P = applySimilarity(transform, { x: p.x, y: p.y });
         g.push(moveXYZA({ x: P.x + cfg.offsets.boardOrigin.x, y: P.y + cfg.offsets.boardOrigin.y }));
         g.push(moveXYZA({ z: cfg.offsets.paste.zPaste }));
-        const area = 1; 
+        const area = 1;
         const ms = cfg.offsets.paste.initMs + area * cfg.offsets.paste.msPerMm2;
         g.push('M106 S255');
         g.push(`G4 P${Math.round(ms)}`);
@@ -23,23 +23,23 @@ export function buildPasteJob({ parts, pads = [], cfg, transform }) {
 }
 
 export function buildPasteFromPads({ pads, cfg, transform }) {
-  const g = [];
-  g.push(...header(cfg.machine));
-  g.push(moveXYZA({ z: safeZ(cfg) }));
-  for (const pad of pads) {
-    const P = applySimilarity(transform, { x: pad.x, y: pad.y });
-    const XY = { x: P.x + cfg.offsets.boardOrigin.x, y: P.y + cfg.offsets.boardOrigin.y };
-    g.push(moveXYZA(XY));
-    g.push(moveXYZA({ z: cfg.offsets.paste.zPaste }));
-    const area = pad.area || 1;
-    const ms = cfg.offsets.paste.initMs + area * cfg.offsets.paste.msPerMm2;
-    g.push('M106 S255');              // actuator ON
-    g.push(`G4 P${Math.round(ms)}`);  // dwell proportional to pad area
-    g.push('M107');                   // actuator OFF
+    const g = [];
+    g.push(...header(cfg.machine));
     g.push(moveXYZA({ z: safeZ(cfg) }));
-  }
-  g.push(...footer());
-  return g;
+    for (const pad of pads) {
+        const P = applySimilarity(transform, { x: pad.x, y: pad.y });
+        const XY = { x: P.x + cfg.offsets.boardOrigin.x, y: P.y + cfg.offsets.boardOrigin.y };
+        g.push(moveXYZA({ ...XY, z: safeZ(cfg), rapid: true }));
+        g.push(moveXYZA({ z: cfg.offsets.paste.zPaste, feed: cfg.offsets.paste.plungeF }));
+        g.push('M106 S255');              // actuator ON
+        const area = pad.area || 1;
+        const ms = cfg.offsets.paste.initMs + area * cfg.offsets.paste.msPerMm2;
+        g.push(`G4 P${Math.round(ms)}`);  // dwell proportional to pad area
+        g.push('M107');                   // actuator OFF
+        g.push(moveXYZA({ z: safeZ(cfg), rapid: true }));
+    }
+    g.push(...footer());
+    return g;
 }
 
 export function buildPickPlaceJob({ parts, cfg, transform }) {
