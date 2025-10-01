@@ -2,7 +2,12 @@ import JSZip from "jszip";
 
 export async function zipTextFiles(fileMap /* array of {name, text} */) {
   const zip = new JSZip();
-  for (const f of fileMap) zip.file(f.name, f.text);
+  for (const f of fileMap) {
+    // Sanitize filename to prevent path traversal
+    const baseName = f.name.split(/[\\/]/).pop(); // Remove any path components
+    const safeName = baseName.replace(/[^a-zA-Z0-9._-]/g, '_').substring(0, 100);
+    zip.file(safeName, f.text);
+  }
   return zip.generateAsync({ type: "blob" });
 }
 

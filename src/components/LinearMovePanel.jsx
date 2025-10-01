@@ -1,4 +1,4 @@
-import { useEffect, useRef, useMemo, useState, use } from "react";
+import { useEffect, useRef, useMemo, useState } from "react";
 import { applyTransform } from "../lib/utils/transform2d";
 import "./LinearMovePanel.css";
 
@@ -8,7 +8,9 @@ export default function LinearMovePanel({
   xf,
   applyXf,
   components = [],
-  axisLetter = "A"
+  axisLetter = "A",
+  collisionDetector,
+  maintenanceManager
 }) {
   const toMachine = (pt) => {
     if (!pt) return null;
@@ -32,8 +34,14 @@ export default function LinearMovePanel({
   const [ddaStep, setDdaStep] = useState(0.5);
   const [rotDeg, setRotDeg] = useState(0);
 
+  const [valveOn, setValveOn] = useState("M106 S255");
+  const [valveOff, setValveOff] = useState("M107");
+  const [dwellMs, setDwellMs] = useState(120);
+
   const [previewPts, setPreviewPts] = useState([])
   const [gcode, setGcode] = useState("");
+  const [collisionWarnings, setCollisionWarnings] = useState([]);
+  const [maintenanceStatus, setMaintenanceStatus] = useState(null);
   const svgRef = useRef(null);
 
   const useHomeForA = () => homeDesign && setA((s) => ({ ...s, ...toMachine(homeDesign) }))
@@ -47,7 +55,17 @@ export default function LinearMovePanel({
   useEffect(() => {
     if (homeDesign) setA((s) => ({ ...s, ...toMachine(homeDesign) }));
     if (focusDesign) setB((s) => ({ ...s, ...toMachine(focusDesign) }));
-  }, [homeDesign, focusDesign, applyXf, xf]);
+
+    // Update collision detector
+    if (collisionDetector) {
+      collisionDetector.updateComponents(components);
+    }
+
+    // Update maintenance status
+    if (maintenanceManager) {
+      setMaintenanceStatus(maintenanceManager.getMaintenanceStatus());
+    }
+  }, [homeDesign, focusDesign, applyXf, xf, components, collisionDetector, maintenanceManager]);
 
   function capLineSpeed(dirx, diry) {
     const ux = Math.abs(dirx) < 1e-9 ? 1e-9 : Math.abs(dirx);
@@ -89,7 +107,7 @@ export default function LinearMovePanel({
       const n = Math.ceil(L / step);
       for (let i = 1; i <= n; i++) {
         const t = i / n;
-        pts.push({ x: a.x + dx * t, y: a.y + dy * t, feed: (vmax * 60) });
+        pts.push({ x: a.x + dx * t, y: a.y + dy * t, feed: Math.min(Vx, Vy) * 60 });
       }
     } else {
       pts.push({ x: b.x, y: b.y, feed: Math.min(Vx, Vy) * 60 });
@@ -99,45 +117,42 @@ export default function LinearMovePanel({
 
   function buildGcode(a, b, segs) {
     const g = [];
-    g.push("; --- linearMovePanel (machine mm) ---");
+    g.push("; --- linearMovePanel (valve actuator) ---");
     g.push("G21");
     g.push("G90");
+
+    // Check for collisions and generate safe path if needed
+    let safePath = segs;
+    if (collisionDetector) {
+      const collisions = collisionDetector.checkPath(a, b, zwork);
+      if (collisions.length > 0) {
+        setCollisionWarnings(collisions);
+        safePath = collisionDetector.generateSafePath(a, b).slice(1); // Remove first point
+      } else {
+        setCollisionWarnings([]);
+      }
+    }
+
     g.push(`G0 Z${fmt(Math.max(zsafe, a.z ?? zsafe))}`);
     g.push(`G0 X${fmt(a.x)} Y${fmt(a.y)}`);
+    if (isFinite(rotDeg) && rotDeg !== 0) g.push(`G0 ${axisLetter}${fmt(rotDeg, 2)}`);
     g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
     g.push("; pick");
     g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
 
-    for (const p of segs) g.push(`G1 X${fmt(p.x)} Y${fmt(p.y)} F${fmt(p.feed, 0)}`);
+    for (const p of safePath) {
+      const z = p.z !== undefined ? p.z : (collisionWarnings.length > 0 ? zsafe : zwork);
+      g.push(`G1 X${fmt(p.x)} Y${fmt(p.y)} Z${fmt(z)} F${fmt(p.feed || Math.min(Vx, Vy) * 60, 0)}`);
+    }
     if (isFinite(rotDeg) && rotDeg !== 0) g.push(`G0 ${axisLetter}${fmt(rotDeg, 2)}`);
 
     g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
-    g.push("; place");
+    g.push(valveOn);
+    g.push(`G4 P${Math.max(0, Math.round(dwellMs))}`);
+    g.push(valveOff);
     g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
 
     return g.join("\n");
-  }
-
-  function plan() {
-    const a = { ...A }, b = { ...B };
-    const segs = planSegments(a, b);
-    setPreviewPts([{ x: a.x, y: a.y }, ...segs.map(s => ({ x: s.x, y: s.y }))]);
-    setGcode(buildGcode(a, b, segs));
-  }
-
-  async function send() {
-    if (!gcode) plan();
-    const lines = (gcode || "").split("\n").filter(Boolean);
-
-    const sendLine = async (ln) => {
-      if (window?.electronSerial?.writeLine) return window.electronSerial.writeLine(ln + "\n");
-      if (window?.serial?.writeLine) return window.serial.writeLine(ln + "\n");
-      console.log(ln);
-    };
-    for (const ln of lines) await sendLine(ln);
-    if (!window?.electronSerial?.writeLine && !window?.serial?.writeLine) {
-      alert("No serail connection detected. G-code printed to console.");
-    }
   }
 
   function flattenPads() {
@@ -155,7 +170,7 @@ export default function LinearMovePanel({
 
     const feedXY = Math.min(Vx, Vy) * 60;
     const g = [];
-    g.push("; --- Pad dispensing job (machine mm) ---");
+    g.push("; --- Pad dispensing job (valve) ---");
     g.push("G21");
     g.push("G90");
     g.push(`G0 Z${fmt(zsafe)}`);
@@ -167,7 +182,9 @@ export default function LinearMovePanel({
       g.push(`G1 X${fmt(mPad.x)} Y${fmt(mPad.y)} F${fmt(feedXY, 0)}`);
       if (isFinite(rotDeg) && rotDeg !== 0) g.push(`G0 ${axisLetter}${fmt(rotDeg, 2)}`);
       g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
-      g.push("; dispense");
+      g.push(valveOn);
+      g.push(`G4 P${Math.max(0, Math.round(dwellMs))}`);
+      g.push(valveOff);
       g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
     }
 
@@ -177,6 +194,33 @@ export default function LinearMovePanel({
     a.download = "dispense_job.gcode";
     a.click();
     URL.revokeObjectURL(a.href);
+  }
+
+  function plan() {
+    const a = { ...A }, b = { ...B };
+    const segs = planSegments(a, b);
+    setPreviewPts([{ x: a.x, y: a.y }, ...segs.map(s => ({ x: s.x, y: s.y }))]);
+    setGcode(buildGcode(a, b, segs));
+  }
+
+  async function send() {
+    if (!gcode) plan();
+    const lines = (gcode || "").split("\n").filter(Boolean);
+
+    // Record dispense for maintenance tracking
+    if (maintenanceManager) {
+      maintenanceManager.recordDispense();
+    }
+
+    const sendLine = async (ln) => {
+      if (window?.electronSerial?.writeLine) return window.electronSerial.writeLine(ln + "\n");
+      if (window?.serial?.writeLine) return window.serial.writeLine(ln + "\n");
+      console.log(ln);
+    };
+    for (const ln of lines) await sendLine(ln);
+    if (!window?.electronSerial?.writeLine && !window?.serial?.writeLine) {
+      alert("No serial connection detected. G-code printed to console.");
+    }
   }
 
   const bbox = useMemo(() => {
@@ -202,7 +246,6 @@ export default function LinearMovePanel({
   return (
     <div className="panel linear-panel">
       <h3>Pick → Place Planner (XY + Zsafe/Zwork)</h3>
-
       <div className="row wrap" style={{ gap: 12 }}>
         <fieldset className="box">
           <legend>A (mm)</legend>
@@ -225,8 +268,8 @@ export default function LinearMovePanel({
           </div>
           <label>Bz <input type="number" value={B.z} onChange={e => setB({ ...B, z: +e.target.value })} /></label>
           <div className="row" style={{ gap: 8 }}>
-            <button className="btn sm" onClick={useFocusForB}>Use Focus</button>
-            <button className="btn sm" onClick={useHomeForB}>Use HOME</button>
+            <button className="btn sm" onClick={useFocusForB}>{typeof t === "function" ? t("Use Focus") : "Use Focus"}</button>
+            <button className="btn sm" onClick={useHomeForB}>{typeof t === "function" ? t("Use HOME") : "Use HOME"}</button>
           </div>
         </fieldset>
 
@@ -266,6 +309,18 @@ export default function LinearMovePanel({
           <legend>Rotation</legend>
           <label>{axisLetter} (deg) <input type="number" step="0.1" value={rotDeg} onChange={e => setRotDeg(+e.target.value)} /></label>
         </fieldset>
+
+        <fieldset className="box">
+          <legend>valve</legend>
+          <div className="grid2">
+            <label>ON G-code <input type="text" value={valveOn} onChange={e => setValveOn(e.target.value)} /></label>
+            <label>OFF G-code <input type="text" value={valveOn} onChange={e => setValveOff(e.target.value)} /></label>
+          </div>
+          <label>Dwell (ms) <input type="number" value={dwellMs} onChange={e => setDwellMs(e.target.value || 0)} /></label>
+          <div className="row" style={{ gap: 8, marginTop: 6 }}>
+            <small>Tip: Marlin = <code>M106 S255</code>/<code>M107</code>. GRBL = <code>M3</code>/<code>M5</code>.</small>
+          </div>
+        </fieldset>
       </div>
 
       <div className="row" style={{ gap: 8 }}>
@@ -274,17 +329,27 @@ export default function LinearMovePanel({
         <button className="btn secondary" onClick={exportJob} disabled={!components?.length}>Export Job (all pads)</button>
       </div>
 
+      {collisionWarnings.length > 0 && (
+        <div className="collision-warning" style={{ background: '#fff3cd', border: '1px solid #ffeaa7', padding: 8, borderRadius: 4, marginTop: 8 }}>
+          <strong>⚠️ Collision Warning:</strong> {collisionWarnings.length} potential collision(s) detected. Safe path will be used.
+        </div>
+      )}
+
+      {maintenanceStatus && (
+        <div className="maintenance-status" style={{ background: '#f8f9fa', border: '1px solid #dee2e6', padding: 8, borderRadius: 4, marginTop: 8 }}>
+          <strong>🔧 Maintenance:</strong> {maintenanceStatus.dispenseCount} dispenses, {maintenanceStatus.hoursRemaining.toFixed(1)}h remaining
+          {maintenanceStatus.needsCleaning && <span style={{ color: '#dc3545' }}> - CLEANING REQUIRED</span>}
+        </div>
+      )}
+
       <div className="row wrap" style={{ gap: 16, marginTop: 12 }}>
         <div className="box" style={{ width: 240 }}>
           <div style={{ fontWeight: 600, marginBottom: 6 }}>Preview (XY)</div>
           <svg ref={svgRef} width="220" height="180">
             <rect x="0" y="0" width="220" height="180" rx="8" ry="8" fill="#0b0b0b" />
-            {/* axes */}
             <line x1="10" y1="170" x2="210" y2="170" stroke="#333" />
             <line x1="10" y1="10" x2="10" y2="170" stroke="#333" />
-            {/* A */}
             <circle cx={project(A).x} cy={project(A).y} r="3.5" fill="#4ade80" />
-            {/* path */}
             {previewPts.length > 1 && (
               <polyline
                 fill="none"
@@ -294,7 +359,6 @@ export default function LinearMovePanel({
                   const q = project(p); return `${q.x},${q.y}`;
                 }).join(" ")} />
             )}
-            {/* B */}
             <circle cx={project(B).x} cy={project(B).y} r="3.5" fill="#ef4444" />
           </svg>
         </div>

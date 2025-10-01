@@ -16,6 +16,11 @@ import { convertGerberToGcode } from "./lib/gerber/gerberToGcode.js";
 import { zipTextFiles, downloadBlob } from "./lib/zip/zipUtils.js";
 
 import { fitSimilarity, fitAffine, applyTransform, rmsError } from "./lib/utils/transform2d.js";
+import { CollisionDetector } from "./lib/collision/collisionDetection.js";
+import { PadDetector } from "./lib/vision/padDetection.js";
+import { QualityController } from "./lib/quality/qualityControl.js";
+import { UndoRedoManager } from "./lib/history/undoRedo.js";
+import { NozzleMaintenanceManager } from "./lib/maintenance/nozzleMaintenance.js";
 
 function padCenter(p) {
   if (typeof p.cx === "number" && typeof p.cy === "number") return { x: p.cx, y: p.cy };
@@ -32,24 +37,15 @@ function padCenter(p) {
   return { x: 0, y: 0 };
 }
 
-function clusterByRadius(points, radiusMm = 1.2) {
-  const used = new Array(points.length).fill(false);
-  const groups = [];
-  for (let i = 0; i < points.length; i++) {
-    if (used[i]) continue;
-    const g = [points[i]]; used[i] = true;
-    for (let j = i + 1; j < points.length; j++) {
-      if (used[j]) continue;
-      const d = Math.hypot(points[j].x - points[i].x, points[j].y - points[i].y);
-      if (d <= radiusMm) { g.push(points[j]); used[j] = true; }
-    }
-    groups.push(g);
-  }
-  return groups.map((g, idx) => {
-    const cx = g.reduce((s, p) => s + p.x, 0) / g.length;
-    const cy = g.reduce((s, p) => s + p.y, 0) / g.length;
-    return { x: cx, y: cy, count: g.length, pads: g, id: `C${idx + 1}` };
-  });
+// Individual pad handling - no clustering
+function processPads(points) {
+  return points.map((pad, idx) => ({
+    x: pad.x,
+    y: pad.y,
+    id: `P${idx + 1}`,
+    width: pad.width || 1,
+    height: pad.height || 1
+  }));
 }
 
 function parseLengthToMm(lenStr = "") {
@@ -65,7 +61,7 @@ export default function App() {
   const [mirrorBottom, setMirrorBottom] = useState(true);
   const [svg, setSvg] = useState("");
 
-  const [components, setComponents] = useState([]);
+  const [pads, setPads] = useState([]);
   const [pasteIdx, setPasteIdx] = useState(null);
 
   const [selectedMm, setSelectedMm] = useState(null);
@@ -84,6 +80,95 @@ export default function App() {
   ]);
   const [xf, setXf] = useState(null);
   const [applyXf, setApplyXf] = useState(false);
+
+  // New feature states
+  const [collisionDetector] = useState(() => new CollisionDetector());
+  const [padDetector] = useState(() => new PadDetector());
+  const [qualityController] = useState(() => new QualityController());
+  const [undoManager] = useState(() => new UndoRedoManager());
+  const [maintenanceManager] = useState(() => new NozzleMaintenanceManager());
+  const [visionEnabled, setVisionEnabled] = useState(false);
+  const [qualityEnabled, setQualityEnabled] = useState(false);
+  const [maintenanceAlert, setMaintenanceAlert] = useState(null);
+  const [toolOffset, setToolOffset] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("toolOffset") || '{"dx": 0, "dy": 0');
+    } catch (error) {
+      return { dx: 0, dy: 0 };
+    }
+  });
+
+  useEffect(() => { 
+    localStorage.setItem("toolOffset", JSON.stringify(toolOffset));
+  }, [toolOffset]);
+
+  // Initialize maintenance manager
+  useEffect(() => {
+    maintenanceManager.setReminderCallback((alert) => {
+      setMaintenanceAlert(alert);
+    });
+  }, [maintenanceManager]);
+
+  // Save state for undo/redo
+  const saveStateForUndo = (action) => {
+    const state = {
+      layers, side, mirrorBottom, pads, pasteIdx, selectedMm, homeIdx, homeMm,
+      fiducials, xf, applyXf, toolOffset, nozzleDia
+    };
+    undoManager.saveState(state, action);
+  };
+
+  // Undo function
+  const handleUndo = () => {
+    const previousState = undoManager.undo();
+    if (previousState) {
+      setLayers(previousState.layers || []);
+      setSide(previousState.side || 'top');
+      setMirrorBottom(previousState.mirrorBottom ?? true);
+      setPads(previousState.pads || []);
+      setPasteIdx(previousState.pasteIdx);
+      setSelectedMm(previousState.selectedMm);
+      setHomeIdx(previousState.homeIdx);
+      setHomeMm(previousState.homeMm);
+      setFiducials(previousState.fiducials || []);
+      setXf(previousState.xf);
+      setApplyXf(previousState.applyXf || false);
+      setToolOffset(previousState.toolOffset || { dx: 0, dy: 0 });
+      setNozzleDia(previousState.nozzleDia || 0.6);
+    }
+  };
+
+  // Redo function
+  const handleRedo = () => {
+    const nextState = undoManager.redo();
+    if (nextState) {
+      setLayers(nextState.layers || []);
+      setSide(nextState.side || 'top');
+      setMirrorBottom(nextState.mirrorBottom ?? true);
+      setPads(nextState.pads || []);
+      setPasteIdx(nextState.pasteIdx);
+      setSelectedMm(nextState.selectedMm);
+      setHomeIdx(nextState.homeIdx);
+      setHomeMm(nextState.homeMm);
+      setFiducials(nextState.fiducials || []);
+      setXf(nextState.xf);
+      setApplyXf(nextState.applyXf || false);
+      setToolOffset(nextState.toolOffset || { dx: 0, dy: 0 });
+      setNozzleDia(nextState.nozzleDia || 0.6);
+    }
+  };
+
+const [nozzleDia, setNozzleDia] = useState(() => {
+  try {
+    return JSON.parse(localStorage.getItem("nozzleDia") || "0.6");
+  } catch (error) {
+    return 0.6;
+  }
+});
+
+useEffect(() => {
+  localStorage.setItem("nozzleDia", JSON.stringify(nozzleDia));
+}, [nozzleDia]);
 
   const transformSummary = useMemo(() => {
     if (!xf) return null;
@@ -123,9 +208,9 @@ export default function App() {
     const pi = ls.findIndex(x => x.type === "solderpaste");
     setPasteIdx(pi >= 0 ? pi : null);
     if (pi >= 0) {
-      const pads = extractPadsMm(ls[pi].text).map(padCenter);
-      setComponents(clusterByRadius(pads, 1.2));
-    } else setComponents([]);
+      const padData = extractPadsMm(ls[pi].text).map(padCenter);
+      setPads(processPads(padData));
+    } else setPads([]);
 
     await rebuild(ls, side);
 
@@ -151,7 +236,12 @@ export default function App() {
     const next = layers.map((l, i) => (i === idx ? { ...l, enabled: !l.enabled } : l));
     setLayers(next); await rebuild(next, side);
   };
-  const changeSide = async (s) => { setSide(s); await rebuild(layers, s); setZoomState(z => ({ ...z, isZoomed: false })); };
+  const changeSide = async (s) => { 
+    saveStateForUndo(`Change side to ${s}`);
+    setSide(s); 
+    await rebuild(layers, s); 
+    setZoomState(z => ({ ...z, isZoomed: false })); 
+  };
 
   async function exportAllSvgsZip() {
     const outputs = [];
@@ -344,11 +434,9 @@ export default function App() {
 
   function nearestPad(mm) {
     let best = { comp: -1, pad: -1, d: Infinity, pos: null };
-    components.forEach((c, ci) => {
-      c.pads.forEach((p, pi) => {
-        const d = Math.hypot(p.x - mm.x, p.y - mm.y);
-        if (d < best.d) best = { comp: ci, pad: pi, d, pos: p };
-      });
+    pads.forEach((p, pi) => {
+      const d = Math.hypot(p.x - mm.x, p.y - mm.y);
+      if (d < best.d) best = { pad: pi, d, pos: p };
     });
     return best.d <= PROX_MM ? best : null;
   }
@@ -426,7 +514,7 @@ export default function App() {
         `Set this PAD as Home/origin?\n≈ X ${hit.pos.x.toFixed(2)} mm, Y ${hit.pos.y.toFixed(2)} mm`
       );
       if (ok) {
-        setHomeIdx(hit.comp);
+        setHomeIdx(hit.pad);
         setHomeMm({ x: hit.pos.x, y: hit.pos.y });
         setSelectedMm(null);
       }
@@ -443,7 +531,7 @@ export default function App() {
     fidPickMode,
     zoomState.enabled, zoomState.isZoomed,
     homeMm,
-    components
+    pads
   ]);
 
   const zoomToComponent = useCallback((ptMm) => {
@@ -502,12 +590,22 @@ export default function App() {
     <div className="wrap" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
       <aside className="sidebar">
         <div className="header">
-          <label className="btn">
-            Open Gerbers / ZIP
-            <input type="file" multiple onChange={pickFiles}
-              accept=".zip,.gbr,.grb,.gtl,.gbl,.gts,.gbs,.gto,.gbo,.gtp,.gbp,.gm1,.drl,.txt,.nc" />
-          </label>
-          <button className="btn secondary" onClick={exportAllSvgsZip}>Download SVGs (ZIP)</button>
+          <div className="row" style={{ marginBottom: 12 }}>
+            <label className="btn">
+              Open Gerbers / ZIP
+              <input type="file" multiple onChange={pickFiles}
+                accept=".zip,.gbr,.grb,.gtl,.gbl,.gts,.gbs,.gto,.gbo,.gtp,.gbp,.gm1,.drl,.txt,.nc" />
+            </label>
+            <button className="btn secondary" onClick={exportAllSvgsZip}>Download SVGs (ZIP)</button>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn sm" onClick={handleUndo} disabled={!undoManager.canUndo()} title="Undo">
+              ↶ Undo
+            </button>
+            <button className="btn sm" onClick={handleRedo} disabled={!undoManager.canRedo()} title="Redo">
+              ↷ Redo
+            </button>
+          </div>
         </div>
 
         <div className="section">
@@ -538,9 +636,9 @@ export default function App() {
               const idx = e.target.value === "" ? null : +e.target.value;
               setPasteIdx(idx);
               if (idx != null) {
-                const pads = extractPadsMm(layers[idx].text).map(padCenter);
-                setComponents(clusterByRadius(pads, 1.2));
-              } else setComponents([]);
+                const padData = extractPadsMm(layers[idx].text).map(padCenter);
+                setPads(processPads(padData));
+              } else setPads([]);
               setSelectedMm(null); setHomeMm(null);
             }}>
               <option value="">(select paste layer)</option>
@@ -548,18 +646,25 @@ export default function App() {
             </select>
           </div>
           <ComponentList
-            components={components}
+            components={pads}
             originIdx={homeIdx}
             onSetHome={(i) => {
-              const comp = components[i]; if (!comp) return;
-              const pad = comp.pads[0] || { x: comp.x, y: comp.y };
+              const pad = pads[i]; if (!pad) return;
+              saveStateForUndo('Set home position');
               setHomeIdx(i); setHomeMm({ x: pad.x, y: pad.y });
             }}
-            onFocus={(c) => {
-              const pad = c.pads?.[0] || { x: c.x, y: c.y };
+            onFocus={(pad) => {
               setSelectedMm({ x: pad.x, y: pad.y });
             }}
           />
+          
+          <div className="section">
+            <h3>Advanced Features</h3>
+            <div className="row wrap" style={{ gap: 8 }}>
+              <label><input type="checkbox" checked={visionEnabled} onChange={(e) => setVisionEnabled(e.target.checked)} /> Vision Guidance</label>
+              <label><input type="checkbox" checked={qualityEnabled} onChange={(e) => setQualityEnabled(e.target.checked)} /> Quality Control</label>
+            </div>
+          </div>
         </div>
       </aside>
 
@@ -588,31 +693,68 @@ export default function App() {
           </div>
         )}
 
-        <FiducialPanel
-          fiducials={fiducials}
-          activeId={fidActiveId}
-          setActiveId={setFidActiveId}
-          pickMode={fidPickMode}
-          togglePickMode={() => setFidPickMode(v => !v)}
-          onInputMachine={onInputMachine}
-          onClearOne={onClearOne}
-          onClearAll={onClearAll}
-          onSolve2={onSolve2}
-          onSolve3={onSolve3}
-          transformSummary={transformSummary}
-          applyTransform={applyXf}
-          setApplyTransform={setApplyXf}
-        />
+        <div className="fiducial-panel">
+          <FiducialPanel
+            fiducials={fiducials}
+            activeId={fidActiveId}
+            setActiveId={setFidActiveId}
+            pickMode={fidPickMode}
+            togglePickMode={() => setFidPickMode(v => !v)}
+            onInputMachine={onInputMachine}
+            onClearOne={onClearOne}
+            onClearAll={onClearAll}
+            onSolve2={onSolve2}
+            onSolve3={onSolve3}
+            transformSummary={transformSummary}
+            applyTransform={applyXf}
+            setApplyTransform={setApplyXf}
+          />
+        </div>
+
+        {maintenanceAlert && (
+          <div className="maintenance-alert" style={{ 
+            position: 'fixed', top: 20, right: 20, background: '#ff6b35', color: 'white', 
+            padding: 16, borderRadius: 8, zIndex: 1000, maxWidth: 300 
+          }}>
+            <h4>🔧 Nozzle Maintenance Required</h4>
+            <p>{maintenanceAlert.type === 'cleaning_reminder' ? 
+              `Dispenses: ${maintenanceAlert.dispenseCount}, Hours: ${Math.round(maintenanceAlert.hoursSinceLastCleaning)}` :
+              'Cleaning completed'}
+            </p>
+            <div className="row" style={{ gap: 8, marginTop: 8 }}>
+              <button className="btn sm" onClick={() => {
+                maintenanceManager.markCleaned();
+                setMaintenanceAlert(null);
+              }}>Mark Cleaned</button>
+              <button className="btn sm secondary" onClick={() => setMaintenanceAlert(null)}>Dismiss</button>
+            </div>
+          </div>
+        )}
 
         <div className="panels">
-          <CameraPanel />
+          <CameraPanel 
+          fiducials={fiducials}
+          xf={xf}
+          applyXf={applyXf}
+          selectedDesign={selectedMm}
+          toolOffset={toolOffset}
+          setToolOffset={(setToolOffset)}
+          nozzleDia={nozzleDia}
+          setNozzleDia={setNozzleDia}
+          visionEnabled={visionEnabled}
+          qualityEnabled={qualityEnabled}
+          padDetector={padDetector}
+          qualityController={qualityController}
+          />
           <LinearMovePanel
             homeDesign={homeMm}
             focusDesign={selectedMm}
             xf={xf}
             applyXf={applyXf}
-            components={components}
+            components={pads}
             axisLetter="A"
+            collisionDetector={collisionDetector}
+            maintenanceManager={maintenanceManager}
           />
           <SerialPanel />
         </div>

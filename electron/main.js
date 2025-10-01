@@ -86,8 +86,11 @@ ipcMain.handle('serial:close', async () => {
 
 ipcMain.handle('serial:writeLine', async (e, line) => {
   if (!serial.port) throw new Error('Not connected');
+  // Sanitize input - only allow G-code commands
+  const sanitized = String(line).replace(/[^A-Za-z0-9\s\-\.]/g, '').substring(0, 200);
+  if (!sanitized.match(/^[GM]\d+/)) throw new Error('Invalid G-code command');
   return new Promise((resolve, reject) => {
-    serial.port.write(line.endsWith('\n') ? line : (line + '\n'), (err) => {
+    serial.port.write(sanitized.endsWith('\n') ? sanitized : (sanitized + '\n'), (err) => {
       if (err) reject(err); else resolve(true);
     });
   });
@@ -97,11 +100,14 @@ ipcMain.handle('serial:sendGcode', async (e, text) => {
   if (!serial.port) throw new Error('Not connected');
   const lines = String(text).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   for (const ln of lines) {
-    await new Promise((resolve, reject) => {
-      serial.port.write(ln + '\n', (err) => err ? reject(err) : resolve(true));
-    });
-    // naive small delay; production: wait for "ok"
-    await new Promise(r => setTimeout(r, 2));
+    // Sanitize each line
+    const sanitized = ln.replace(/[^A-Za-z0-9\s\-\.]/g, '').substring(0, 200);
+    if (sanitized && (sanitized.match(/^[GM]\d+/) || sanitized.startsWith(';'))) {
+      await new Promise((resolve, reject) => {
+        serial.port.write(sanitized + '\n', (err) => err ? reject(err) : resolve(true));
+      });
+      await new Promise(r => setTimeout(r, 2));
+    }
   }
   return true;
 });
