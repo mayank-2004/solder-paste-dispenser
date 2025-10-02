@@ -101,8 +101,6 @@ export default function App() {
   useEffect(() => { 
     localStorage.setItem("toolOffset", JSON.stringify(toolOffset));
   }, [toolOffset]);
-
-  // Initialize maintenance manager
   useEffect(() => {
     maintenanceManager.setReminderCallback((alert) => {
       setMaintenanceAlert(alert);
@@ -341,7 +339,7 @@ useEffect(() => {
     t.setAttribute("x", x); t.setAttribute("y", y);
     t.setAttribute("fill", fill); t.setAttribute("font-size", String(size));
     t.setAttribute("paint-order", "stroke"); t.setAttribute("stroke", stroke);
-    t.setAttribute("stroke-width", String(size * 0.2)); t.textContent = text;
+    t.setAttribute("stroke-width", String(size * 0.2)); t.textContent = String(text || '');
     g.appendChild(t);
   };
 
