@@ -1,3 +1,5 @@
+import "./LayerList.css";
+
 export default function LayerList({ layers, onToggle }) {
   const sideIcon = (s) => s === "top" ? "⬆" : s === "bottom" ? "⬇" : "↔";
   const typeEmoji = (t) => ({
@@ -5,7 +7,7 @@ export default function LayerList({ layers, onToggle }) {
   }[t] || "📄");
 
   return (
-    <ul className="layer-list">
+    <ul className="layer-list" style={{ marginLeft: 8 }}>
       {layers.map((l, idx)=>(
         <li key={l.filename}>
           <label title={l.filename}>

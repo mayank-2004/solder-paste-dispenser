@@ -1,4 +1,3 @@
-// Quality control for paste dispensing
 export class QualityController {
   constructor() {
     this.dispensingHistory = [];

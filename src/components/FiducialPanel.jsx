@@ -1,4 +1,5 @@
 import React from "react";
+import "./FiducialPanel.css";
 
 export default function FiducialPanel({
   fiducials,           
@@ -13,7 +14,11 @@ export default function FiducialPanel({
   onSolve3,            
   transformSummary,    
   applyTransform,      
-  setApplyTransform
+  setApplyTransform,
+  detectionResult,
+  onRedetectFiducials,
+  onAutoAlign,
+  onAutoDetectCamera
 }) {
   const ready2 = fiducials.filter(f => f.design && f.machine).length >= 2;
   const ready3 = fiducials.filter(f => f.design && f.machine).length >= 3;
@@ -21,8 +26,30 @@ export default function FiducialPanel({
   return (
     <div className="section">
       <h3>Fiducials & Alignment</h3>
+      
+      {detectionResult !== null && (
+        <div className={`info ${detectionResult.length === 0 ? 'warning' : 'success'}`} style={{ marginBottom: 12 }}>
+          {detectionResult.length > 0 ? (
+            <div>
+              <strong>✓ Auto-detected {detectionResult.length} fiducial{detectionResult.length > 1 ? 's' : ''}</strong>
+              <div style={{ fontSize: '0.9em', marginTop: 4 }}>
+                {detectionResult.map(fid => 
+                  `${fid.id}: ${fid.x.toFixed(2)}, ${fid.y.toFixed(2)}mm (${Math.round(fid.confidence * 100)}%)`
+                ).join(' • ')}
+              </div>
+            </div>
+          ) : (
+            <div>
+              <strong>⚠ No fiducials detected</strong>
+              <div style={{ fontSize: '0.9em', marginTop: 4 }}>
+                Please manually place fiducials or ensure your Gerber files contain fiducial markers (typically 1-3mm circular pads)
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
-      <div className="row" style={{ gap: 8, alignItems: "center" }}>
+      <div className="flex-row" style={{ gap: 8, alignItems: "center" }}>
         <button className={`btn ${pickMode ? "" : "secondary"}`} onClick={togglePickMode}>
           {pickMode ? "Pick/Drag fiducials: ON" : "Pick/Drag fiducials"}
         </button>
@@ -31,7 +58,20 @@ export default function FiducialPanel({
           {fiducials.map(f => <option key={f.id} value={f.id}>{f.id}</option>)}
         </select>
         <button className="btn secondary" onClick={onClearAll}>Clear all</button>
-        <label className="row" style={{ gap: 6, marginLeft: "auto" }}>
+        {onRedetectFiducials && (
+          <button className="btn" onClick={onRedetectFiducials} title="Re-analyze Gerber files for fiducials">
+            🔍 Re-detect
+          </button>
+        )}
+        <button className="btn" onClick={onAutoAlign} title="Auto-align machine coordinates from design">
+          🎯 Auto-align
+        </button>
+        {onAutoDetectCamera && (
+          <button className="btn" onClick={onAutoDetectCamera} title="Detect fiducials using camera">
+            📷 Camera Detect
+          </button>
+        )}
+        <label className="flex-row" style={{ gap: 6, marginLeft: "auto" }}>
           <input type="checkbox" checked={applyTransform} onChange={(e)=>setApplyTransform(e.target.checked)} />
           Apply transform to outputs
         </label>
@@ -47,12 +87,13 @@ export default function FiducialPanel({
               <td>
                 <span style={{ display: "inline-block", width: 10, height: 10, background: f.color, borderRadius: 4, marginRight: 6 }}/>
                 <strong>{f.id}</strong>{activeId === f.id ? " (armed)" : ""}
+                {f.confidence && <span style={{ fontSize: '0.8em', color: '#666' }}> ({Math.round(f.confidence * 100)}%)</span>}
               </td>
               <td>
                 {f.design ? `X ${f.design.x.toFixed(3)}, Y ${f.design.y.toFixed(3)}` : <em>— click/drag on PCB —</em>}
               </td>
               <td>
-                <div className="row" style={{ gap: 6 }}>
+                <div className="flex-row" style={{ gap: 6 }}>
                   <input className="in sm" placeholder="Mx"
                          value={f.machine?.x ?? ""} onChange={(e)=>onInputMachine(f.id, {x:parseFloat(e.target.value), y:f.machine?.y})}/>
                   <input className="in sm" placeholder="My"
@@ -65,7 +106,7 @@ export default function FiducialPanel({
         </tbody>
       </table>
 
-      <div className="row" style={{ gap: 8 }}>
+      <div className="flex-row" style={{ gap: 8 }}>
         <button className="btn" disabled={!ready2} onClick={onSolve2}>Solve (2-pt similarity)</button>
         <button className="btn secondary" disabled={!ready3} onClick={onSolve3}>Solve (3-pt affine)</button>
       </div>

@@ -1,3 +1,4 @@
+// LinearMovePanel.jsx - Improved version with better layout
 import { useEffect, useRef, useMemo, useState } from "react";
 import { applyTransform } from "../lib/utils/transform2d";
 import "./LinearMovePanel.css";
@@ -48,10 +49,7 @@ export default function LinearMovePanel({
   const useFocusForB = () => focusDesign && setB((s) => ({ ...s, ...toMachine(focusDesign) }))
   const useHomeForB = () => homeDesign && setB((s) => ({ ...s, ...toMachine(homeDesign) }))
   const useFocusForA = () => focusDesign && setA((s) => ({ ...s, ...toMachine(focusDesign) }))
-  const swapAb = () => {
-    setA(B);
-    setB(A);
-  }
+
   useEffect(() => {
     if (homeDesign) setA((s) => ({ ...s, ...toMachine(homeDesign) }));
     if (focusDesign) setB((s) => ({ ...s, ...toMachine(focusDesign) }));
@@ -171,6 +169,7 @@ export default function LinearMovePanel({
     const feedXY = Math.min(Vx, Vy) * 60;
     const g = [];
     g.push("; --- Pad dispensing job (valve) ---");
+    g.push("; Coordinate transformation applied: " + (applyXf && xf ? "YES" : "NO"));
     g.push("G21");
     g.push("G90");
     g.push(`G0 Z${fmt(zsafe)}`);
@@ -246,35 +245,55 @@ export default function LinearMovePanel({
   return (
     <div className="panel linear-panel">
       <h3>Pick → Place Planner (XY + Zsafe/Zwork)</h3>
-      <div className="row wrap" style={{ gap: 12 }}>
+      
+      {/* Points A and B */}
+      <div className="params-row">
         <fieldset className="box">
-          <legend>A (mm)</legend>
+          <legend>Point A (mm)</legend>
           <div className="grid2">
-            <label>Ax <input type="number" value={A.x} onChange={e => setA({ ...A, x: +e.target.value })} /></label>
-            <label>Ay <input type="number" value={A.y} onChange={e => setA({ ...A, y: +e.target.value })} /></label>
+            <label>
+              X Position
+              <input type="number" value={A.x} onChange={e => setA({ ...A, x: +e.target.value })} />
+            </label>
+            <label>
+              Y Position
+              <input type="number" value={A.y} onChange={e => setA({ ...A, y: +e.target.value })} />
+            </label>
           </div>
-          <label>Az <input type="number" value={A.z} onChange={e => setA({ ...A, z: +e.target.value })} /></label>
-          <div className="row" style={{ gap: 8 }}>
+          <label>
+            Z Position
+            <input type="number" value={A.z} onChange={e => setA({ ...A, z: +e.target.value })} />
+          </label>
+          <div className="row" style={{ gap: 8, marginTop: 8 }}>
             <button className="btn sm" onClick={useHomeForA}>Use HOME</button>
             <button className="btn sm" onClick={useFocusForA}>Use Focus</button>
           </div>
         </fieldset>
 
         <fieldset className="box">
-          <legend>B (mm)</legend>
+          <legend>Point B (mm)</legend>
           <div className="grid2">
-            <label>Bx <input type="number" value={B.x} onChange={e => setB({ ...B, x: +e.target.value })} /></label>
-            <label>By <input type="number" value={B.y} onChange={e => setB({ ...B, y: +e.target.value })} /></label>
+            <label>
+              X Position
+              <input type="number" value={B.x} onChange={e => setB({ ...B, x: +e.target.value })} />
+            </label>
+            <label>
+              Y Position
+              <input type="number" value={B.y} onChange={e => setB({ ...B, y: +e.target.value })} />
+            </label>
           </div>
-          <label>Bz <input type="number" value={B.z} onChange={e => setB({ ...B, z: +e.target.value })} /></label>
-          <div className="row" style={{ gap: 8 }}>
-            <button className="btn sm" onClick={useFocusForB}>{typeof t === "function" ? t("Use Focus") : "Use Focus"}</button>
-            <button className="btn sm" onClick={useHomeForB}>{typeof t === "function" ? t("Use HOME") : "Use HOME"}</button>
+          <label>
+            Z Position
+            <input type="number" value={B.z} onChange={e => setB({ ...B, z: +e.target.value })} />
+          </label>
+          <div className="row" style={{ gap: 8, marginTop: 8 }}>
+            <button className="btn sm" onClick={useFocusForB}>Use Focus</button>
+            <button className="btn sm" onClick={useHomeForB}>Use HOME</button>
           </div>
         </fieldset>
 
         <fieldset className="box faint">
-          <legend>Limits</legend>
+          <legend>Motion Limits</legend>
           <div className="grid2">
             <label>Vx (mm/s) <input type="number" value={Vx} onChange={e => setVx(+e.target.value)} /></label>
             <label>Vy (mm/s) <input type="number" value={Vy} onChange={e => setVy(+e.target.value)} /></label>
@@ -286,69 +305,100 @@ export default function LinearMovePanel({
         </fieldset>
       </div>
 
-      <div className="row wrap" style={{ gap: 12 }}>
+      {/* Configuration row */}
+      <div className="params-row">
         <fieldset className="box">
           <legend>Heights</legend>
           <div className="grid2">
-            <label>Zsafe <input type="number" step="0.1" value={zsafe} onChange={e => setZsafe(+e.target.value)} /></label>
-            <label>Zwork <input type="number" step="0.05" value={zwork} onChange={e => setZwork(+e.target.value)} /></label>
+            <label>
+              Safe Height (Zsafe)
+              <input type="number" step="0.1" value={zsafe} onChange={e => setZsafe(+e.target.value)} />
+            </label>
+            <label>
+              Work Height (Zwork)
+              <input type="number" step="0.05" value={zwork} onChange={e => setZwork(+e.target.value)} />
+            </label>
           </div>
         </fieldset>
 
         <fieldset className="box">
           <legend>Algorithm</legend>
-          <select value={algo} onChange={e => setAlgo(e.target.value)}>
-            <option value="linear">Linear (diagonal)</option>
-            <option value="axis">Axis-sequential (X → Y)</option>
-            <option value="blended">Blended (S-curve approx)</option>
-            <option value="dda">DDA staircase</option>
-          </select>
+          <label>
+            Path Type
+            <select value={algo} onChange={e => setAlgo(e.target.value)}>
+              <option value="linear">Linear (diagonal)</option>
+              <option value="axis">Axis-sequential (X → Y)</option>
+              <option value="blended">Blended (S-curve approx)</option>
+              <option value="dda">DDA staircase</option>
+            </select>
+          </label>
+          {algo === "dda" && (
+            <label style={{ marginTop: 8 }}>
+              DDA Step (mm)
+              <input type="number" step="0.1" value={ddaStep} onChange={e => setDdaStep(+e.target.value)} />
+            </label>
+          )}
         </fieldset>
 
         <fieldset className="box">
           <legend>Rotation</legend>
-          <label>{axisLetter} (deg) <input type="number" step="0.1" value={rotDeg} onChange={e => setRotDeg(+e.target.value)} /></label>
+          <label>
+            {axisLetter} Axis (degrees)
+            <input type="number" step="0.1" value={rotDeg} onChange={e => setRotDeg(+e.target.value)} />
+          </label>
         </fieldset>
 
         <fieldset className="box">
-          <legend>valve</legend>
-          <div className="grid2">
-            <label>ON G-code <input type="text" value={valveOn} onChange={e => setValveOn(e.target.value)} /></label>
-            <label>OFF G-code <input type="text" value={valveOn} onChange={e => setValveOff(e.target.value)} /></label>
-          </div>
-          <label>Dwell (ms) <input type="number" value={dwellMs} onChange={e => setDwellMs(e.target.value || 0)} /></label>
-          <div className="row" style={{ gap: 8, marginTop: 6 }}>
-            <small>Tip: Marlin = <code>M106 S255</code>/<code>M107</code>. GRBL = <code>M3</code>/<code>M5</code>.</small>
-          </div>
+          <legend>Valve Control</legend>
+          <label>
+            ON G-code
+            <input type="text" value={valveOn} onChange={e => setValveOn(e.target.value)} />
+          </label>
+          <label>
+            OFF G-code
+            <input type="text" value={valveOff} onChange={e => setValveOff(e.target.value)} />
+          </label>
+          <label>
+            Dwell Time (ms)
+            <input type="number" value={dwellMs} onChange={e => setDwellMs(+e.target.value || 0)} />
+          </label>
+          <small style={{ marginTop: 4, display: 'block' }}>
+            Marlin: <code>M106 S255</code>/<code>M107</code> | GRBL: <code>M3</code>/<code>M5</code>
+          </small>
         </fieldset>
       </div>
 
-      <div className="row" style={{ gap: 8 }}>
+      {/* Action buttons */}
+      <div className="controls">
         <button className="btn" onClick={plan}>Plan</button>
         <button className="btn" onClick={send}>Send</button>
-        <button className="btn secondary" onClick={exportJob} disabled={!components?.length}>Export Job (all pads)</button>
+        <button className="btn secondary" onClick={exportJob} disabled={!components?.length}>
+          Export Job (all pads)
+        </button>
       </div>
 
+      {/* Status messages */}
       {collisionWarnings.length > 0 && (
-        <div className="collision-warning" style={{ background: '#fff3cd', border: '1px solid #ffeaa7', padding: 8, borderRadius: 4, marginTop: 8 }}>
+        <div className="collision-warning">
           <strong>⚠️ Collision Warning:</strong> {collisionWarnings.length} potential collision(s) detected. Safe path will be used.
         </div>
       )}
 
       {maintenanceStatus && (
-        <div className="maintenance-status" style={{ background: '#f8f9fa', border: '1px solid #dee2e6', padding: 8, borderRadius: 4, marginTop: 8 }}>
+        <div className={`maintenance-status ${maintenanceStatus.needsCleaning ? 'warning' : ''}`}>
           <strong>🔧 Maintenance:</strong> {maintenanceStatus.dispenseCount} dispenses, {maintenanceStatus.hoursRemaining.toFixed(1)}h remaining
-          {maintenanceStatus.needsCleaning && <span style={{ color: '#dc3545' }}> - CLEANING REQUIRED</span>}
+          {maintenanceStatus.needsCleaning && <span style={{ color: '#dc3545', marginLeft: 8 }}>CLEANING REQUIRED</span>}
         </div>
       )}
 
-      <div className="row wrap" style={{ gap: 16, marginTop: 12 }}>
-        <div className="box" style={{ width: 240 }}>
-          <div style={{ fontWeight: 600, marginBottom: 6 }}>Preview (XY)</div>
-          <svg ref={svgRef} width="220" height="180">
+      {/* Preview and G-code section */}
+      <div className="preview-section">
+        <div className="box preview-box">
+          <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 14 }}>Preview (XY)</div>
+          <svg ref={svgRef} width="220" height="180" className="preview-canvas">
             <rect x="0" y="0" width="220" height="180" rx="8" ry="8" fill="#0b0b0b" />
-            <line x1="10" y1="170" x2="210" y2="170" stroke="#333" />
-            <line x1="10" y1="10" x2="10" y2="170" stroke="#333" />
+            <line x1="10" y1="170" x2="210" y2="170" stroke="#333" strokeWidth="1" />
+            <line x1="10" y1="10" x2="10" y2="170" stroke="#333" strokeWidth="1" />
             <circle cx={project(A).x} cy={project(A).y} r="3.5" fill="#4ade80" />
             {previewPts.length > 1 && (
               <polyline
@@ -356,18 +406,33 @@ export default function LinearMovePanel({
                 stroke="#ffd400"
                 strokeWidth="2"
                 points={previewPts.map(p => {
-                  const q = project(p); return `${q.x},${q.y}`;
-                }).join(" ")} />
+                  const q = project(p); 
+                  return `${q.x},${q.y}`;
+                }).join(" ")} 
+              />
             )}
             <circle cx={project(B).x} cy={project(B).y} r="3.5" fill="#ef4444" />
           </svg>
         </div>
 
-        <div className="box" style={{ flex: 1, minWidth: 260 }}>
-          <div style={{ fontWeight: 600, marginBottom: 6 }}>G-code</div>
-          <pre style={{ maxHeight: 220, overflow: "auto", margin: 0 }}>{gcode}</pre>
+        <div className="box gcode-box">
+          <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 14 }}>Generated G-code</div>
+          <pre style={{ 
+            background: '#ffffff', 
+            border: '1px solid #dee2e6', 
+            borderRadius: 4, 
+            padding: 8, 
+            fontFamily: "'Courier New', monospace", 
+            fontSize: 11,
+            maxHeight: 200, 
+            overflowY: 'auto', 
+            margin: 0,
+            lineHeight: 1.4
+          }}>
+            {gcode || "Click 'Plan' to generate G-code"}
+          </pre>
         </div>
       </div>
     </div>
-  )
+  );
 }

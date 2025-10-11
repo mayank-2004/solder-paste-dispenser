@@ -1,5 +1,6 @@
 // src/components/SerialPanel.jsx
 import { useEffect, useRef, useState } from "react";
+import "./SerialPanel.css";
 
 export default function SerialPanel() {
   const [ports, setPorts] = useState([]);           // [{path, label}]
@@ -73,7 +74,7 @@ export default function SerialPanel() {
     <div className="card">
       <h3>Machine</h3>
 
-      <div className="row">
+      <div className="flex-row">
         <button className="btn secondary" onClick={refresh}>Refresh</button>
 
         {/* Port dropdown */}
@@ -101,7 +102,7 @@ export default function SerialPanel() {
         </div>
       )}
 
-      <div className="row" style={{marginTop:8}}>
+      <div className="flex-row" style={{marginTop:8}}>
         <input ref={inputRef} placeholder="G-code line..." style={{flex:1}} />
         <button className="btn" onClick={sendLine} disabled={!connected}>Send</button>
         <label className="btn">

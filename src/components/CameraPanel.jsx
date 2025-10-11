@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { applyTransform } from "../lib/utils/transform2d";
+import { FiducialVisionDetector } from "../lib/vision/fiducialVision.js";
 import "./CameraPanel.css";
 
 export default function CameraPanel({
@@ -11,8 +12,8 @@ export default function CameraPanel({
   setToolOffset,
   nozzleDia,
   setNozzleDia,
-  visionEnabled = false,
-  qualityEnabled = false,
+  // visionEnabled = false,
+  // qualityEnabled = false,
   padDetector,
   qualityController
 }) {
@@ -34,6 +35,12 @@ export default function CameraPanel({
   const [visionResult, setVisionResult] = useState(null);
   const [qualityResult, setQualityResult] = useState(null);
   const [autoDetecting, setAutoDetecting] = useState(false);
+
+  const [visionEnabled, setVisionEnabled] = useState(false);
+  const [qualityEnabled, setQualityEnabled] = useState(false);
+  const [fiducialDetector] = useState(() => new FiducialVisionDetector());
+  // const [autoDetecting, setAutoDetecting] = useState(false);
+  const [detectionInterval, setDetectionInterval] = useState(null);
 
   // helpers for safe formatting
   const f3 = (v) => (Number.isFinite(v) ? v.toFixed(3) : "—");
@@ -63,8 +70,8 @@ export default function CameraPanel({
     for (let i = 0; i < n; i++) {
       const { x, y } = wp[i]; const { u, v } = pp[i];
       const r = 2 * i;
-      A[r][0]=x; A[r][1]=y; A[r][2]=1; A[r][3]=0; A[r][4]=0; A[r][5]=0; A[r][6]=-u*x; A[r][7]=-u*y; b[r]=u;
-      A[r+1][0]=0; A[r+1][1]=0; A[r+1][2]=0; A[r+1][3]=x; A[r+1][4]=y; A[r+1][5]=1; A[r+1][6]=-v*x; A[r+1][7]=-v*y; b[r+1]=v;
+      A[r][0] = x; A[r][1] = y; A[r][2] = 1; A[r][3] = 0; A[r][4] = 0; A[r][5] = 0; A[r][6] = -u * x; A[r][7] = -u * y; b[r] = u;
+      A[r + 1][0] = 0; A[r + 1][1] = 0; A[r + 1][2] = 0; A[r + 1][3] = x; A[r + 1][4] = y; A[r + 1][5] = 1; A[r + 1][6] = -v * x; A[r + 1][7] = -v * y; b[r + 1] = v;
     }
     const AT = transpose(A);
     const ATA = matMul(AT, A);
@@ -74,23 +81,23 @@ export default function CameraPanel({
     return [
       [h[0], h[1], h[2]],
       [h[3], h[4], h[5]],
-      [h[6], h[7], 1   ],
+      [h[6], h[7], 1],
     ];
   }, []);
 
-  function transpose(M){const r=M.length,c=M[0].length,T=Array.from({length:c},()=>new Array(r));for(let i=0;i<r;i++)for(let j=0;j<c;j++)T[j][i]=M[i][j];return T;}
-  function matMul(A,B){const r=A.length,k=A[0].length,c=B[0].length,M=Array.from({length:r},()=>new Array(c).fill(0));for(let i=0;i<r;i++){for(let j=0;j<c;j++){let s=0;for(let t=0;t<k;t++)s+=A[i][t]*B[t][j];M[i][j]=s;}}return M;}
-  function vecMul(A,v){const r=A.length,c=A[0].length,out=new Array(r).fill(0);for(let i=0;i<r;i++){let s=0;for(let j=0;j<c;j++)s+=A[i][j]*v[j];out[i]=s;}return out;}
-  function solveSymmetric(M,b){const n=M.length;const A=Array.from({length:n},(_,i)=>[...M[i],b[i]]);for(let i=0;i<n;i++){let piv=A[i][i];if(Math.abs(piv)<1e-12)return null;const inv=1/piv;for(let j=i;j<=n;j++)A[i][j]*=inv;for(let r=0;r<n;r++){if(r===i)continue;const f=A[r][i];for(let j=i;j<=n;j++)A[r][j]-=f*A[i][j];}}return A.map(row=>row[n]);}
+  function transpose(M) { const r = M.length, c = M[0].length, T = Array.from({ length: c }, () => new Array(r)); for (let i = 0; i < r; i++)for (let j = 0; j < c; j++)T[j][i] = M[i][j]; return T; }
+  function matMul(A, B) { const r = A.length, k = A[0].length, c = B[0].length, M = Array.from({ length: r }, () => new Array(c).fill(0)); for (let i = 0; i < r; i++) { for (let j = 0; j < c; j++) { let s = 0; for (let t = 0; t < k; t++)s += A[i][t] * B[t][j]; M[i][j] = s; } } return M; }
+  function vecMul(A, v) { const r = A.length, c = A[0].length, out = new Array(r).fill(0); for (let i = 0; i < r; i++) { let s = 0; for (let j = 0; j < c; j++)s += A[i][j] * v[j]; out[i] = s; } return out; }
+  function solveSymmetric(M, b) { const n = M.length; const A = Array.from({ length: n }, (_, i) => [...M[i], b[i]]); for (let i = 0; i < n; i++) { let piv = A[i][i]; if (Math.abs(piv) < 1e-12) return null; const inv = 1 / piv; for (let j = i; j <= n; j++)A[i][j] *= inv; for (let r = 0; r < n; r++) { if (r === i) continue; const f = A[r][i]; for (let j = i; j <= n; j++)A[r][j] -= f * A[i][j]; } } return A.map(row => row[n]); }
 
   const projectPx = useCallback((pt) => {
     if (!H || !pt) return null;
     const { x, y } = pt;
-    const u = H[0][0]*x + H[0][1]*y + H[0][2];
-    const v = H[1][0]*x + H[1][1]*y + H[1][2];
-    const w = H[2][0]*x + H[2][1]*y + H[2][2];
+    const u = H[0][0] * x + H[0][1] * y + H[0][2];
+    const v = H[1][0] * x + H[1][1] * y + H[1][2];
+    const w = H[2][0] * x + H[2][1] * y + H[2][2];
     if (!Number.isFinite(w) || Math.abs(w) < 1e-9) return null;
-    return { u: u/w, v: v/w };
+    return { u: u / w, v: v / w };
   }, [H]);
 
   const pxPerMmAt = useCallback((pt) => {
@@ -115,7 +122,7 @@ export default function CameraPanel({
       const q = projectPx(p.world);
       if (!q) continue;
       const dx = q.u - p.pixel.u, dy = q.v - p.pixel.v;
-      s2 += dx*dx + dy*dy; n++;
+      s2 += dx * dx + dy * dy; n++;
     }
     if (!n) return null;
     return Math.sqrt(s2 / n);
@@ -141,7 +148,7 @@ export default function CameraPanel({
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }
 
-  function tick(){ drawOverlay(); rafRef.current = requestAnimationFrame(tick); }
+  function tick() { drawOverlay(); rafRef.current = requestAnimationFrame(tick); }
 
   function drawOverlay() {
     const v = videoRef.current, c = canvasRef.current;
@@ -179,7 +186,7 @@ export default function CameraPanel({
     }
 
     if (predictedPx) {
-      const baseWorld = (applyXf && xf && selectedDesign) ? applyTransform(xf, selectedDesign) : (selectedDesign || { x:0, y:0 });
+      const baseWorld = (applyXf && xf && selectedDesign) ? applyTransform(xf, selectedDesign) : (selectedDesign || { x: 0, y: 0 });
       const pxmm = pxPerMmAt(baseWorld) || 10;
       const r = Math.max(2, (nozzleDia || 0.6) * 0.5 * pxmm);
 
@@ -212,7 +219,7 @@ export default function CameraPanel({
       ctx.stroke();
       ctx.fillStyle = "#ff4d4f";
       ctx.font = "12px ui-monospace, monospace";
-      const baseWorld = (applyXf && xf && selectedDesign) ? applyTransform(xf, selectedDesign) : (selectedDesign || { x:0, y:0 });
+      const baseWorld = (applyXf && xf && selectedDesign) ? applyTransform(xf, selectedDesign) : (selectedDesign || { x: 0, y: 0 });
       const pxmm = pxPerMmAt(baseWorld) || 10;
       const mm = Math.hypot(dx, dy) / pxmm;
       ctx.fillText(`${mm.toFixed(3)} mm (${dx.toFixed(1)}px, ${dy.toFixed(1)}px)`,
@@ -260,13 +267,13 @@ export default function CameraPanel({
   // Vision-guided pad detection
   const detectPadAtPosition = async () => {
     if (!padDetector || !selectedDesign || !H) return;
-    
+
     setAutoDetecting(true);
     try {
       padDetector.updateHomography(H);
       const result = await padDetector.detectPad(selectedDesign, { width: 1, height: 1 });
       setVisionResult(result);
-      
+
       if (result && result.detected) {
         console.log('Pad detected at:', result.position, 'Offset:', result.offset);
       }
@@ -277,9 +284,86 @@ export default function CameraPanel({
     }
   };
 
+  // Automated fiducial detection using camera
+  const detectFiducialsWithCamera = async () => {
+    if (!videoRef.current || !streamOn) {
+      alert('Please start the camera first');
+      return;
+    }
+
+    setAutoDetecting(true);
+    try {
+      fiducialDetector.setHomography(H);
+      const result = await fiducialDetector.detectFiducialsInFrame(videoRef.current, fiducials);
+      
+      if (result.success && result.fiducials.length > 0) {
+        console.log('Auto-detected fiducials:', result.fiducials);
+        
+        // Update fiducial positions with detected coordinates
+        const updatedFiducials = result.fiducials.map((detected, idx) => {
+          const existing = fiducials[idx] || { id: `F${idx + 1}`, color: `#${Math.floor(Math.random()*16777215).toString(16)}` };
+          return {
+            ...existing,
+            machine: detected.machinePosition,
+            pixelPosition: detected.pixelPosition,
+            confidence: detected.confidence,
+            autoDetected: true
+          };
+        });
+        
+        // Trigger callback to update parent state
+        if (window.updateFiducialsFromCamera) {
+          window.updateFiducialsFromCamera(updatedFiducials);
+        }
+        
+        alert(`Successfully detected ${result.fiducials.length} fiducials!`);
+      } else {
+        alert('No fiducials detected. Ensure fiducials are visible and camera is properly positioned.');
+      }
+    } catch (error) {
+      console.error('Camera fiducial detection failed:', error);
+      alert('Fiducial detection failed: ' + error.message);
+    } finally {
+      setAutoDetecting(false);
+    }
+  };
+
+  // Start continuous fiducial monitoring
+  const startContinuousDetection = () => {
+    if (!videoRef.current || !streamOn) {
+      alert('Please start the camera first');
+      return;
+    }
+
+    if (detectionInterval) {
+      // Stop existing detection
+      fiducialDetector.stopContinuousDetection(detectionInterval);
+      setDetectionInterval(null);
+      return;
+    }
+
+    const intervalId = fiducialDetector.startContinuousDetection(
+      videoRef.current,
+      (result) => {
+        if (result.success && result.fiducials.length > 0) {
+          console.log('Continuous detection result:', result.fiducials.length, 'fiducials');
+          // Update overlay with detected fiducials
+          setVisionResult({
+            detected: true,
+            fiducials: result.fiducials,
+            confidence: result.fiducials.reduce((sum, f) => sum + f.confidence, 0) / result.fiducials.length
+          });
+        }
+      },
+      2000 // Check every 2 seconds
+    );
+    
+    setDetectionInterval(intervalId);
+  };
+
   const analyzeQuality = async () => {
     if (!qualityController || !selectedDesign || !H) return;
-    
+
     try {
       const canvas = canvasRef.current;
       const padInfo = {
@@ -287,10 +371,10 @@ export default function CameraPanel({
         position: selectedDesign,
         size: { width: 1, height: 1 }
       };
-      
+
       const result = await qualityController.analyzePasteQuality(canvas, padInfo, H);
       setQualityResult(result);
-      
+
       if (result) {
         console.log('Quality analysis:', result);
       }
@@ -310,136 +394,144 @@ export default function CameraPanel({
     <div className="panel camera-panel">
       <h3>Camera / Overlay Verification</h3>
 
-      <div className="row wrap" style={{ gap: 12 }}>
-        <div className="box" style={{ flex: 1, minWidth: 300 }}>
-          <div style={{ position: "relative", width: "100%", aspectRatio: "16 / 9", background: "#111", borderRadius: 8, overflow: "hidden" }}>
-            <video ref={videoRef} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted playsInline />
-            <canvas ref={canvasRef}
-              onClick={onCanvasClick}
-              style={{ position: "absolute", inset: 0, pointerEvents: "auto" }} />
+      <div className="box advanced-features-box">
+        <legend>Advanced Features</legend>
+        <div className="advanced-features-checkboxes">
+          <label>
+            <input
+              type="checkbox"
+              checked={visionEnabled}
+              onChange={(e) => setVisionEnabled(e.target.checked)}
+            />
+            Vision Guidance
+          </label>
+          {visionEnabled && (
+            <button className="btn sm" onClick={detectPadAtPosition} disabled={!selectedDesign || autoDetecting}>
+              {autoDetecting ? 'Detecting...' : 'Detect Pad'}
+            </button>
+          )}
+          <label>
+            <input
+              type="checkbox"
+              checked={qualityEnabled}
+              onChange={(e) => setQualityEnabled(e.target.checked)}
+            />
+            Quality Control
+          </label>
+          {qualityEnabled && (
+            <button className="btn sm" onClick={analyzeQuality} disabled={!selectedDesign}>
+              Analyze Quality
+            </button>
+          )}
+        </div>
+        
+        <div className="fiducial-detection-section">
+          <h4>Automated Fiducial Detection</h4>
+          <div className="flex-row" style={{ gap: 8 }}>
+            <button 
+              className="btn" 
+              onClick={detectFiducialsWithCamera} 
+              disabled={!streamOn || autoDetecting}
+            >
+              {autoDetecting ? 'Detecting...' : '📷 Detect Fiducials'}
+            </button>
+            <button 
+              className={`btn ${detectionInterval ? 'secondary' : ''}`}
+              onClick={startContinuousDetection}
+              disabled={!streamOn}
+            >
+              {detectionInterval ? 'Stop Monitor' : '🔄 Monitor Fiducials'}
+            </button>
           </div>
-          <div className="row" style={{ gap: 8, marginTop: 8 }}>
-            {!streamOn ? (
-              <button className="btn" onClick={startCam}>Start Camera</button>
-            ) : (
-              <button className="btn secondary" onClick={stopCam}>Stop Camera</button>
-            )}
-            <label className="row" style={{ gap: 8, marginLeft: 8 }}>
-              <input type="checkbox" checked={showOverlay} onChange={e => setShowOverlay(e.target.checked)} />
-              Show overlay
-            </label>
-            <label className="row" style={{ gap: 8, marginLeft: 8 }}>
-              <input type="checkbox" checked={measureMode} onChange={e => setMeasureMode(e.target.checked)} />
-              Measure error
-            </label>
-            {visionEnabled && (
-              <button className="btn sm" onClick={detectPadAtPosition} disabled={!selectedDesign || autoDetecting}>
-                {autoDetecting ? 'Detecting...' : 'Detect Pad'}
-              </button>
-            )}
-            {qualityEnabled && (
-              <button className="btn sm" onClick={analyzeQuality} disabled={!selectedDesign}>
-                Analyze Quality
-              </button>
-            )}
-          </div>
+          <small style={{ fontSize: '12px', color: '#6c757d' }}>
+            Position camera over PCB and click 'Detect Fiducials' for automatic detection
+          </small>
+        </div>
+      </div>
 
-          <div className="row wrap" style={{ gap: 12, marginTop: 8 }}>
-            <div className="box">
-              <legend>Nozzle</legend>
-              <label className="row" style={{ gap: 8 }}>
-                Diameter (mm)
-                <input
-                  type="number" step="0.05" value={nozzleDia ?? 0.6}
-                  onChange={e => setNozzleDia(Math.max(0.05, +e.target.value || 0.6))}
-                  style={{ width: 100 }}
-                />
-              </label>
+      {/* Video Container */}
+      <div style={{ position: "relative", width: "100%", aspectRatio: "16 / 9", background: "#111", borderRadius: 8, overflow: "hidden" }}>
+        <video ref={videoRef} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted playsInline />
+        <canvas ref={canvasRef}
+          onClick={onCanvasClick}
+          style={{ position: "absolute", inset: 0, pointerEvents: "auto" }} />
+      </div>
+
+      {/* Camera Controls */}
+      <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+        {!streamOn ? (
+          <button className="btn" onClick={startCam}>Start Camera</button>
+        ) : (
+          <button className="btn secondary" onClick={stopCam}>Stop Camera</button>
+        )}
+        <label className="row" style={{ gap: 8, marginLeft: 8 }}>
+          <input type="checkbox" checked={showOverlay} onChange={e => setShowOverlay(e.target.checked)} />
+          Show overlay
+        </label>
+        <label className="row" style={{ gap: 8, marginLeft: 8 }}>
+          <input type="checkbox" checked={measureMode} onChange={e => setMeasureMode(e.target.checked)} />
+          Measure error
+        </label>
+        {/* {visionEnabled && (
+          <button className="btn sm" onClick={detectPadAtPosition} disabled={!selectedDesign || autoDetecting}>
+            {autoDetecting ? 'Detecting...' : 'Detect Pad'}
+          </button>
+        )}
+        {qualityEnabled && (
+          <button className="btn sm" onClick={analyzeQuality} disabled={!selectedDesign}>
+            Analyze Quality
+          </button>
+        )} */}
+      </div>
+
+      {/* Settings Row - Nozzle & Tool Offset */}
+      <div className="camera-controls-row">
+        {/* Nozzle & Dispensing */}
+        <div className="box nozzle-section">
+          <legend>Nozzle & Dispensing</legend>
+          <div className="settings-grid">
+            <div className="settings-field">
+              <label>Diameter (mm)</label>
+              <input type="number" step="0.05" value={nozzleDia ?? 0.6}
+                onChange={e => setNozzleDia(Math.max(0.05, +e.target.value || 0.6))} />
             </div>
-            <div className="box" style={{ minWidth: 150, marginLeft: -330, marginTop: 430 }}>
-              <legend style={{fontWeight: 600, fontFamily: 'Arial, sans-serif'}}>Tool Offset</legend>
-              <div className="row" style={{ gap: 8 }}>
-                <div>
-                  <span>ΔX (mm)</span>
-                  <input type="number" step="0.01" value={toolOffset?.dx ?? 0}
-                    onChange={e => setToolOffset({ dx: +e.target.value || 0, dy: toolOffset?.dy || 0 })} style={{ width: 100 }} />
-                </div>
-                <div>
-                  <span>ΔY (mm)</span>
-                  <input type="number" step="0.01" value={toolOffset?.dy ?? 0}
-                    onChange={e => setToolOffset({ dx: toolOffset?.dx || 0, dy: +e.target.value || 0 })} style={{ width: 100 }} />
-                </div>
-              </div>
-              <small>Offsets are added to machine XY before projecting to camera. Saved in your browser.</small>
+            <div className="settings-field">
+              <label>Pressure (bar)</label>
+              <input type="number" step="0.1" defaultValue="2.0" />
             </div>
+            <div className="settings-field">
+              <label>Flow Rate (%)</label>
+              <input type="number" step="5" defaultValue="50" />
+            </div>
+            <div className="settings-field">
+              <label>Duration (ms)</label>
+              <input type="number" step="10" defaultValue="100" />
+            </div>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn" disabled={!selectedDesign}>Test Dispense</button>
+            <button className="btn secondary">Prime Nozzle</button>
           </div>
         </div>
 
-        <div className="box" style={{ minWidth: 400, marginLeft: -330, marginTop: 90 }}>
-          <div style={{ fontWeight: 600, marginBottom: 6 }}>Calibration (mm → pixels)</div>
-          <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 8 }}>
-            Pick ≥4 fiducials: for each, click <em>Pick Pixel</em>, then click that same point on the video.
+        {/* Tool Offset */}
+        <div className="box tool-offset-section">
+          <legend>Tool Offset</legend>
+          <div className="offset-inputs">
+            <div className="offset-field">
+              <span>ΔX (mm)</span>
+              <input type="number" step="0.01" value={toolOffset?.dx ?? 0}
+                onChange={e => setToolOffset({ dx: +e.target.value || 0, dy: toolOffset?.dy || 0 })} />
+            </div>
+            <div className="offset-field">
+              <span>ΔY (mm)</span>
+              <input type="number" step="0.01" value={toolOffset?.dy ?? 0}
+                onChange={e => setToolOffset({ dx: toolOffset?.dx || 0, dy: +e.target.value || 0 })} />
+            </div>
           </div>
-          <div style={{ maxHeight: 260, overflow: "auto" }}>
-            {fidRows.map(f => {
-              const p = pairs.find(pp => pp.id === f.id);
-              const u = p?.pixel?.u, v = p?.pixel?.v;
-              const wx = f.world?.x, wy = f.world?.y;
-              const hasWorld = Number.isFinite(wx) && Number.isFinite(wy);
-              return (
-                <div key={f.id} className="row" style={{ justifyContent: "space-between", gap: 8, padding: "6px 0", borderBottom: "1px dashed #e5e7eb" }}>
-                  <div>
-                    <div style={{ fontWeight: 600, color: f.color }}>{f.id}</div>
-                    <div style={{ fontSize: 12 }}>W: {f3(wx)}, {f3(wy)} mm</div>
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 12 }}>Px: {f1(u)}, {f1(v)}</div>
-                    <button
-                      className="btn sm"
-                      onClick={() => addOrPick(f.id)}
-                      disabled={!hasWorld}
-                      title={!hasWorld ? "No world coordinates yet for this fiducial." : ""}
-                    >
-                      {pendingPick === f.id ? "Click video…" : "Pick Pixel"}
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="row" style={{ gap: 8, marginTop: 8 }}>
-            <button className="btn" disabled={(pairs.filter(p => p.pixel && p.world).length < 4)} onClick={solveNow}>Solve</button>
-            <button className="btn secondary" onClick={clearPairs}>Clear</button>
-          </div>
-
-          <div style={{ marginTop: 10 }}>
-            <div>Pairs: <b>{pairs.filter(p => p.pixel && p.world).length}</b> {H ? " | Solved ✓" : ""}</div>
-            {H && <div>RMS error: <b>{f1(rms)} px</b></div>}
-            
-            {visionEnabled && visionResult && (
-              <div style={{ marginTop: 8, padding: 8, background: '#f0f8ff', borderRadius: 4 }}>
-                <div><strong>Vision Result:</strong></div>
-                <div>Detected: {visionResult.detected ? '✓' : '✗'}</div>
-                {visionResult.detected && (
-                  <>
-                    <div>Confidence: {(visionResult.confidence * 100).toFixed(0)}%</div>
-                    <div>Offset: X{visionResult.offset.x.toFixed(3)}, Y{visionResult.offset.y.toFixed(3)}</div>
-                  </>
-                )}
-              </div>
-            )}
-            
-            {qualityEnabled && qualityResult && (
-              <div style={{ marginTop: 8, padding: 8, background: qualityResult.passed ? '#f0fff0' : '#fff0f0', borderRadius: 4 }}>
-                <div><strong>Quality Result:</strong></div>
-                <div>Score: {(qualityResult.qualityScore * 100).toFixed(0)}% {qualityResult.passed ? '✓' : '✗'}</div>
-                <div>Coverage: {(qualityResult.coverage * 100).toFixed(0)}%</div>
-                <div>Volume: {(qualityResult.volume * 100).toFixed(0)}%</div>
-                <div>Uniformity: {(qualityResult.uniformity * 100).toFixed(0)}%</div>
-              </div>
-            )}
-          </div>
+          <small style={{ fontSize: '12px', color: '#6c757d' }}>
+            Offsets are added to machine XY before projecting to camera. Saved in your browser.
+          </small>
         </div>
       </div>
     </div>

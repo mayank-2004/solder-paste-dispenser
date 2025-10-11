@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import "./Viewer.css";
 
 export default function Viewer({
   svg,
@@ -16,13 +17,14 @@ export default function Viewer({
     if (canvasRef.current) {
       const canvas = canvasRef.current;
       canvas.innerHTML = svg;
+      console.log("SVG updated", svg);
 
-      // Apply mirror transformation if needed
       const svgElement = canvas.querySelector("svg");
       if (svgElement) {
         svgElement.setAttribute("preserveAspectRatio", "xMidYMid meet");
         svgElement.style.width = "100%";
         svgElement.style.height = "100%";
+        svgElement.style.objectFit = "contain";
 
         // Apply mirror transformation if needed
         if (mirrorBottom && side === "bottom") {
@@ -41,7 +43,7 @@ export default function Viewer({
   };
 
   return (
-    <div className="viewer">
+    <div className={`viewer ${zoomEnabled ? "zoom-enabled" : ""} ${isZoomed ? "zoomed" : ""}`}>
       <div className="viewer-toolbar">
         {!isZoomed ? (
           <button

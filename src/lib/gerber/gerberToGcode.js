@@ -22,6 +22,10 @@ export function convertGerberToGcode(gerberText, opts = {}) {
     crealityFeedZ: 600,      // mm/min
     crealityEPerMm: 0.05,    // fake extrusion so the viewer shows the path
 
+    // Coordinate transformation
+    transform: null,         // transformation matrix from design to machine coordinates
+    applyTransform: false,   // whether to apply transformation
+
     ...opts
   };
 
@@ -72,7 +76,13 @@ export function convertGerberToGcode(gerberText, opts = {}) {
     return { x, y, i, j };
   };
 
-  // Helpers to get mm
+  // Helpers to get mm and apply coordinate transformation
+  const applyCoordTransform = (pt) => {
+    if (!cfg.applyTransform || !cfg.transform) return pt;
+    const { a, b, c, d, tx, ty } = cfg.transform;
+    return { x: a * pt.x + b * pt.y + tx, y: c * pt.x + d * pt.y + ty };
+  };
+  
   const mmX = (x) => units === 'in' ? x * IN2MM : x;
   const mmY = (y) => units === 'in' ? y * IN2MM : y;
   const dmm = (x0,y0,x1,y1) => Math.hypot(mmX(x1)-mmX(x0), mmY(y1)-mmY(y0));
@@ -89,7 +99,9 @@ export function convertGerberToGcode(gerberText, opts = {}) {
     let last = { x: curX, y: curY };
 
     const pushPoint = (px, py) => {
-      const X = mmX(px), Y = mmY(py);
+      let X = mmX(px), Y = mmY(py);
+      const transformed = applyCoordTransform({ x: X, y: Y });
+      X = transformed.x; Y = transformed.y;
       if (!current.length) current.push({ x: X, y: Y });
       current.push({ x: X, y: Y });
     };
@@ -127,7 +139,9 @@ export function convertGerberToGcode(gerberText, opts = {}) {
         if (currentD === 3) {
           // flash: make a tiny "tick" so viewer shows something
           breakPolyline();
-          const X = mmX(x), Y = mmY(y);
+          let X = mmX(x), Y = mmY(y);
+          const transformed = applyCoordTransform({ x: X, y: Y });
+          X = transformed.x; Y = transformed.y;
           polylines.push([{ x: X, y: Y }, { x: X + 0.2, y: Y }]);
           last = { x, y };
           continue;
@@ -265,9 +279,22 @@ export function convertGerberToGcode(gerberText, opts = {}) {
   const toolOff = () => push(cfg.toolOff);
   const plunge  = () => push(`G1 Z${fmt(cfg.workZ,3)} F${fmt(cfg.feedZ,2)}`);
   const retract = () => push(`G0 Z${fmt(cfg.travelZ,3)}`);
-  const rapidXY = (x,y) => push(`G0 X${fmt(units==='in'?x*IN2MM:x)} Y${fmt(units==='in'?y*IN2MM:y)}`);
-  const lineXY  = (x,y) => push(`G1 X${fmt(units==='in'?x*IN2MM:x)} Y${fmt(units==='in'?y*IN2MM:y)}`);
-  const arcXYIJ = (code, x, y, i, j) => push(`${code} X${fmt(units==='in'?x*IN2MM:x)} Y${fmt(units==='in'?y*IN2MM:y)} I${fmt(units==='in'?i*IN2MM:i)} J${fmt(units==='in'?j*IN2MM:j)}`);
+  const rapidXY = (x,y) => {
+    let X = units==='in'?x*IN2MM:x, Y = units==='in'?y*IN2MM:y;
+    const transformed = applyCoordTransform({ x: X, y: Y });
+    push(`G0 X${fmt(transformed.x)} Y${fmt(transformed.y)}`);
+  };
+  const lineXY  = (x,y) => {
+    let X = units==='in'?x*IN2MM:x, Y = units==='in'?y*IN2MM:y;
+    const transformed = applyCoordTransform({ x: X, y: Y });
+    push(`G1 X${fmt(transformed.x)} Y${fmt(transformed.y)}`);
+  };
+  const arcXYIJ = (code, x, y, i, j) => {
+    let X = units==='in'?x*IN2MM:x, Y = units==='in'?y*IN2MM:y;
+    let I = units==='in'?i*IN2MM:i, J = units==='in'?j*IN2MM:j;
+    const transformed = applyCoordTransform({ x: X, y: Y });
+    push(`${code} X${fmt(transformed.x)} Y${fmt(transformed.y)} I${fmt(I)} J${fmt(J)}`);
+  };
 
   for (let raw of tokens) {
     const t = raw.replace(/\s+/g,''); if (!t || /^G0?4/i.test(t)) continue;

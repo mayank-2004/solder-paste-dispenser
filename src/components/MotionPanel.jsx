@@ -1,5 +1,6 @@
 // src/components/MotionPanel.jsx
 import { useMemo, useState } from "react";
+import "./MotionPanel.css";
 import { defaultAxisMap, defaultFeeds, header, home, setWorkZero, moveAbs, jogRel } from "../lib/motion/gcode.js";
 
 export default function MotionPanel({ onSendLines }) {

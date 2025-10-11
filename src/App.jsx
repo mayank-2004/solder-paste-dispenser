@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import JSZip from "jszip";
+import "./App.css";
 
 import LayerList from "./components/LayerList.jsx";
 import Viewer from "./components/Viewer.jsx";
@@ -8,19 +9,22 @@ import SerialPanel from "./components/SerialPanel.jsx";
 import ComponentList from "./components/ComponentList.jsx";
 import LinearMovePanel from "./components/LinearMovePanel.jsx";
 import FiducialPanel from "./components/FiducialPanel.jsx";
-
 import { identifyLayers } from "./lib/gerber/identifyLayers.js";
 import { stackupToSvg } from "./lib/gerber/stackupToSvg.js";
 import { extractPadsMm } from "./lib/gerber/extractPads.js";
 import { convertGerberToGcode } from "./lib/gerber/gerberToGcode.js";
+import { analyzeFiducialsInLayers } from "./lib/gerber/fiducialDetection.js";
+import { detectPcbOrigins } from "./lib/gerber/originDetection.js";
+import { FiducialVisionDetector } from "./lib/vision/fiducialVision.js";
 import { zipTextFiles, downloadBlob } from "./lib/zip/zipUtils.js";
-
 import { fitSimilarity, fitAffine, applyTransform, rmsError } from "./lib/utils/transform2d.js";
 import { CollisionDetector } from "./lib/collision/collisionDetection.js";
 import { PadDetector } from "./lib/vision/padDetection.js";
 import { QualityController } from "./lib/quality/qualityControl.js";
 import { UndoRedoManager } from "./lib/history/undoRedo.js";
 import { NozzleMaintenanceManager } from "./lib/maintenance/nozzleMaintenance.js";
+import { generatePath } from "./lib/motion/pathGeneration.js";
+import { combinePadLayers, getAvailableLayerCombinations } from "./lib/gerber/padCombiner.js";
 
 function padCenter(p) {
   if (typeof p.cx === "number" && typeof p.cy === "number") return { x: p.cx, y: p.cy };
@@ -37,7 +41,6 @@ function padCenter(p) {
   return { x: 0, y: 0 };
 }
 
-// Individual pad handling - no clustering
 function processPads(points) {
   return points.map((pad, idx) => ({
     x: pad.x,
@@ -65,11 +68,18 @@ export default function App() {
   const [pasteIdx, setPasteIdx] = useState(null);
 
   const [selectedMm, setSelectedMm] = useState(null);
-  const [homeIdx, setHomeIdx] = useState(null);
-  const [homeMm, setHomeMm] = useState(null);
-  const [pairStats, setPairStats] = useState(null);
+  const [padDistances, setPadDistances] = useState([]);
+  const [generatedPath, setGeneratedPath] = useState(null);
+  const [pathType, setPathType] = useState('direct'); // 'direct', 'safe', 'optimized'
 
-  const [zoomState, setZoomState] = useState({ enabled: false, isZoomed: false, baseViewBox: null, zoomFactor: 4, zoomPadding: 2 });
+  const [zoomState, setZoomState] = useState({ 
+    enabled: false, 
+    isZoomed: false, 
+    baseViewBox: null, 
+    zoomLevel: 0, // 0 = normal, 1 = 2x, 2 = 4x, 3 = 8x
+    maxZoomLevel: 3,
+    zoomPadding: 2 
+  });
 
   const [fidPickMode, setFidPickMode] = useState(false);
   const [fidActiveId, setFidActiveId] = useState(null);
@@ -78,6 +88,11 @@ export default function App() {
     { id: "F2", design: null, machine: null, color: "#8e2bff" },
     { id: "F3", design: null, machine: null, color: "#00c49a" },
   ]);
+  const [fiducialDetectionResult, setFiducialDetectionResult] = useState(null);
+  const [originCandidates, setOriginCandidates] = useState([]);
+  const [selectedOrigin, setSelectedOrigin] = useState(null);
+  const [referencePoint, setReferencePoint] = useState(null); // Can be origin or fiducial
+  const [referenceType, setReferenceType] = useState('origin'); // 'origin' or 'fiducial'
   const [xf, setXf] = useState(null);
   const [applyXf, setApplyXf] = useState(false);
 
@@ -87,8 +102,9 @@ export default function App() {
   const [qualityController] = useState(() => new QualityController());
   const [undoManager] = useState(() => new UndoRedoManager());
   const [maintenanceManager] = useState(() => new NozzleMaintenanceManager());
-  const [visionEnabled, setVisionEnabled] = useState(false);
-  const [qualityEnabled, setQualityEnabled] = useState(false);
+  const [fiducialVisionDetector] = useState(() => new FiducialVisionDetector());
+  // const [visionEnabled, setVisionEnabled] = useState(false);
+  // const [qualityEnabled, setQualityEnabled] = useState(false);
   const [maintenanceAlert, setMaintenanceAlert] = useState(null);
   const [toolOffset, setToolOffset] = useState(() => {
     try {
@@ -98,9 +114,21 @@ export default function App() {
     }
   });
 
-  useEffect(() => { 
+  const [pcbOriginOffset, setPcbOriginOffset] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("pcbOriginOffset") || '{"x": 0, "y": 0');
+    } catch (error) {
+      return { x: 0, y: 0 };
+    }
+  });
+
+  useEffect(() => {
     localStorage.setItem("toolOffset", JSON.stringify(toolOffset));
   }, [toolOffset]);
+
+  useEffect(() => {
+    localStorage.setItem("pcbOriginOffset", JSON.stringify(pcbOriginOffset));
+  }, [pcbOriginOffset]);
   useEffect(() => {
     maintenanceManager.setReminderCallback((alert) => {
       setMaintenanceAlert(alert);
@@ -110,7 +138,7 @@ export default function App() {
   // Save state for undo/redo
   const saveStateForUndo = (action) => {
     const state = {
-      layers, side, mirrorBottom, pads, pasteIdx, selectedMm, homeIdx, homeMm,
+      layers, side, mirrorBottom, pads, pasteIdx, selectedMm,
       fiducials, xf, applyXf, toolOffset, nozzleDia
     };
     undoManager.saveState(state, action);
@@ -126,8 +154,6 @@ export default function App() {
       setPads(previousState.pads || []);
       setPasteIdx(previousState.pasteIdx);
       setSelectedMm(previousState.selectedMm);
-      setHomeIdx(previousState.homeIdx);
-      setHomeMm(previousState.homeMm);
       setFiducials(previousState.fiducials || []);
       setXf(previousState.xf);
       setApplyXf(previousState.applyXf || false);
@@ -146,8 +172,6 @@ export default function App() {
       setPads(nextState.pads || []);
       setPasteIdx(nextState.pasteIdx);
       setSelectedMm(nextState.selectedMm);
-      setHomeIdx(nextState.homeIdx);
-      setHomeMm(nextState.homeMm);
       setFiducials(nextState.fiducials || []);
       setXf(nextState.xf);
       setApplyXf(nextState.applyXf || false);
@@ -156,17 +180,17 @@ export default function App() {
     }
   };
 
-const [nozzleDia, setNozzleDia] = useState(() => {
-  try {
-    return JSON.parse(localStorage.getItem("nozzleDia") || "0.6");
-  } catch (error) {
-    return 0.6;
-  }
-});
+  const [nozzleDia, setNozzleDia] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("nozzleDia") || "0.6");
+    } catch (error) {
+      return 0.6;
+    }
+  });
 
-useEffect(() => {
-  localStorage.setItem("nozzleDia", JSON.stringify(nozzleDia));
-}, [nozzleDia]);
+  useEffect(() => {
+    localStorage.setItem("nozzleDia", JSON.stringify(nozzleDia));
+  }, [nozzleDia]);
 
   const transformSummary = useMemo(() => {
     if (!xf) return null;
@@ -181,6 +205,14 @@ useEffect(() => {
     }
     return out;
   }, [xf, fiducials]);
+
+  // Verify coordinate transformation
+  const verifyTransform = useCallback((designPt) => {
+    if (!xf || !applyXf) return designPt;
+    const transformed = applyTransform(xf, designPt);
+    console.log(`Transform verification: Design(${designPt.x.toFixed(3)}, ${designPt.y.toFixed(3)}) → Machine(${transformed.x.toFixed(3)}, ${transformed.y.toFixed(3)})`);
+    return transformed;
+  }, [xf, applyXf]);
 
   const pickFiles = async (e) => handleFiles(e.target.files);
   const onDrop = async (e) => { e.preventDefault(); await handleFiles(e.dataTransfer.files); };
@@ -210,17 +242,62 @@ useEffect(() => {
       setPads(processPads(padData));
     } else setPads([]);
 
+    // Detect fiducials automatically
+    const detectedFiducials = analyzeFiducialsInLayers(ls);
+    setFiducialDetectionResult(detectedFiducials);
+
+    // Detect origin candidates
+    const origins = detectPcbOrigins(ls);
+    console.log('Detected origins:', origins);
+    setOriginCandidates(origins);
+    if (origins.length > 0) {
+      const origin = { ...origins[0], id: 'O1' };
+      console.log('Setting selected origin:', origin);
+      setSelectedOrigin(origin); // Auto-select bottom-left origin
+      setPcbOriginOffset({ x: origin.x, y: origin.y });
+    }
+
+    if (detectedFiducials.length > 0) {
+      // Auto-populate fiducials with detected positions
+      const colors = ["#2ea8ff", "#8e2bff", "#00c49a", "#ff6b35", "#9c27b0", "#4caf50"];
+      const autoFiducials = detectedFiducials.map((fid, idx) => ({
+        id: fid.id,
+        design: { x: fid.x, y: fid.y },
+        machine: null,
+        color: colors[idx % colors.length],
+        confidence: fid.confidence
+      }));
+
+      // Fill remaining slots with empty fiducials
+      while (autoFiducials.length < 3) {
+        autoFiducials.push({
+          id: `F${autoFiducials.length + 1}`,
+          design: null,
+          machine: null,
+          color: colors[autoFiducials.length % colors.length]
+        });
+      }
+
+      setFiducials(autoFiducials);
+    } else {
+      // No fiducials detected, use default empty ones
+      setFiducials([
+        { id: "F1", design: null, machine: null, color: "#2ea8ff" },
+        { id: "F2", design: null, machine: null, color: "#8e2bff" },
+        { id: "F3", design: null, machine: null, color: "#00c49a" },
+      ]);
+      setFiducialDetectionResult([]);
+    }
+
     await rebuild(ls, side);
 
-    setSelectedMm(null); setHomeIdx(null); setHomeMm(null); setPairStats(null);
+    setSelectedMm(null);
     setZoomState(z => ({ ...z, isZoomed: false, baseViewBox: null }));
-    setFiducials([
-      { id: "F1", design: null, machine: null, color: "#2ea8ff" },
-      { id: "F2", design: null, machine: null, color: "#8e2bff" },
-      { id: "F3", design: null, machine: null, color: "#00c49a" },
-    ]);
     setXf(null); setApplyXf(false);
     setFidPickMode(false); setFidActiveId(null);
+    // Don't clear origin candidates and selectedOrigin here - they were just set above
+    
+    queueMicrotask(() => { updateOverlay(); });
 
     queueMicrotask(() => { updateOverlay(); });
   }
@@ -234,11 +311,11 @@ useEffect(() => {
     const next = layers.map((l, i) => (i === idx ? { ...l, enabled: !l.enabled } : l));
     setLayers(next); await rebuild(next, side);
   };
-  const changeSide = async (s) => { 
+  const changeSide = async (s) => {
     saveStateForUndo(`Change side to ${s}`);
-    setSide(s); 
-    await rebuild(layers, s); 
-    setZoomState(z => ({ ...z, isZoomed: false })); 
+    setSide(s);
+    await rebuild(layers, s);
+    setZoomState(z => ({ ...z, isZoomed: false }));
   };
 
   async function exportAllSvgsZip() {
@@ -254,7 +331,11 @@ useEffect(() => {
   }
   async function exportAllGcodeZip(flavor = "marlin") {
     const outputs = layers.map(l => {
-      const gc = convertGerberToGcode(l.text, { flavor });
+      const gc = convertGerberToGcode(l.text, { 
+        flavor,
+        transform: xf,
+        applyTransform: applyXf && xf
+      });
       const base = l.filename.replace(/\.[^.]+$/, "");
       return { name: `${base}.gcode`, text: gc };
     });
@@ -345,44 +426,170 @@ useEffect(() => {
 
   const updateOverlay = useCallback(() => {
     const gm = ensureGroup("overlay-markers"); if (!gm) return;
+    const svgEl = getSvgEl(); if (!svgEl) return;
 
-    if (homeMm) {
-      const uh = mmToUnits(homeMm);
-      if (inView(uh)) {
-        drawCircle(gm, uh.x, uh.y, uh.r, "rgba(0,180,0,0.25)", "#0a0");
-        drawText(gm, uh.x + uh.r * 1.6, uh.y - uh.r * 0.8, "HOME", uh.r * 1.3, "#0a0");
-      }
+    // Always get fresh geometry from current viewBox
+    const geom = getSvgGeom(); if (!geom) return;
+
+    // Helper to convert mm to current viewBox units
+    const mmToCurrentUnits = (ptMm) => {
+      return {
+        x: ptMm.x / geom.mmPerUnit + geom.minX,
+        y: ptMm.y / geom.mmPerUnit + geom.minY,
+        r: 1 / geom.mmPerUnit
+      };
+    };
+
+    // Draw reference point (origin or fiducial)
+    const activeRef = referencePoint || selectedOrigin;
+    if (activeRef) {
+      const uh = mmToCurrentUnits({ x: activeRef.x, y: activeRef.y });
+      const isOrigin = activeRef === selectedOrigin;
+      const color = isOrigin ? "#0a0" : "#ff6600";
+      const label = isOrigin ? "PCB ORIGIN" : `REF: ${activeRef.id || 'FIDUCIAL'}`;
+      drawCircle(gm, uh.x, uh.y, uh.r, isOrigin ? "rgba(0,180,0,0.25)" : "rgba(255,102,0,0.25)", color);
+      drawText(gm, uh.x + uh.r * 1.6, uh.y - uh.r * 0.8, label, uh.r * 1.0, color);
     }
+
     if (selectedMm) {
-      const u = mmToUnits(selectedMm);
-      if (inView(u)) drawCircle(gm, u.x, u.y, u.r, "rgba(255,0,0,0.25)", "#d00");
+      // Find the selected pad to draw border around it
+      const selectedPad = pads.find(p => Math.abs(p.x - selectedMm.x) < 0.1 && Math.abs(p.y - selectedMm.y) < 0.1);
+      if (selectedPad) {
+        const u = mmToCurrentUnits(selectedMm);
+        const padWidth = (selectedPad.width || 1) / geom.mmPerUnit;
+        const padHeight = (selectedPad.height || 1) / geom.mmPerUnit;
+        
+        // Draw border rectangle centered on pad
+        const rect = document.createElementNS(NS, "rect");
+        rect.setAttribute("x", u.x - padWidth/2);
+        rect.setAttribute("y", u.y - padHeight/2);
+        rect.setAttribute("width", padWidth);
+        rect.setAttribute("height", padHeight);
+        rect.setAttribute("fill", "none");
+        rect.setAttribute("stroke", "#ff0000");
+        rect.setAttribute("stroke-width", u.r * 0.15);
+        rect.setAttribute("stroke-dasharray", "2,2");
+        gm.appendChild(rect);
+        
+        // Draw center crosshair
+        const crossSize = Math.min(padWidth, padHeight) * 0.3;
+        const hLine = document.createElementNS(NS, "line");
+        hLine.setAttribute("x1", u.x - crossSize/2);
+        hLine.setAttribute("y1", u.y);
+        hLine.setAttribute("x2", u.x + crossSize/2);
+        hLine.setAttribute("y2", u.y);
+        hLine.setAttribute("stroke", "#ff0000");
+        hLine.setAttribute("stroke-width", u.r * 0.1);
+        gm.appendChild(hLine);
+        
+        const vLine = document.createElementNS(NS, "line");
+        vLine.setAttribute("x1", u.x);
+        vLine.setAttribute("y1", u.y - crossSize/2);
+        vLine.setAttribute("x2", u.x);
+        vLine.setAttribute("y2", u.y + crossSize/2);
+        vLine.setAttribute("stroke", "#ff0000");
+        vLine.setAttribute("stroke-width", u.r * 0.1);
+        gm.appendChild(vLine);
+      }
     }
 
-    if (homeMm && selectedMm) {
-      const uh = mmToUnits(homeMm), uf = mmToUnits(selectedMm);
-      if (inView(uh) && inView(uf)) {
+    // Draw generated path
+    if (generatedPath && activeRef && selectedMm) {
+      const gp = ensureGroup("overlay-path");
+      
+      // Draw path segments
+      generatedPath.segments.forEach((segment, idx) => {
+        const start = mmToCurrentUnits(segment.start);
+        const end = mmToCurrentUnits(segment.end);
+        
         const line = document.createElementNS(NS, "line");
-        line.setAttribute("x1", uh.x); line.setAttribute("y1", uh.y);
-        line.setAttribute("x2", uf.x); line.setAttribute("y2", uf.y);
-        line.setAttribute("stroke", "#ff0"); line.setAttribute("stroke-width", uh.r * 0.25);
-        line.setAttribute("stroke-dasharray", `${uh.r * 0.8},${uh.r * 0.6}`);
-        gm.appendChild(line);
-        const midX = (uh.x + uf.x) / 2, midY = (uh.y + uf.y) / 2 - uh.r * 0.6;
-        if (pairStats) drawText(gm, midX, midY, `${pairStats.dist.toFixed(2)} mm`, uh.r * 1.2, "#222", "#fffb");
-      }
+        line.setAttribute("x1", start.x); line.setAttribute("y1", start.y);
+        line.setAttribute("x2", end.x); line.setAttribute("y2", end.y);
+        
+        // Different colors for different segment types
+        const color = segment.type === 'lift' ? '#00ff00' : 
+                     segment.type === 'travel' ? '#0080ff' :
+                     segment.type === 'lower' ? '#ff8000' : '#ff0';
+        
+        line.setAttribute("stroke", color);
+        line.setAttribute("stroke-width", start.r * 0.3);
+        line.setAttribute("stroke-dasharray", segment.type === 'travel' ? "4,2" : "none");
+        gp.appendChild(line);
+      });
+      
+      // Draw waypoints
+      generatedPath.points.forEach((point, idx) => {
+        if (point.type === 'waypoint') {
+          const up = mmToCurrentUnits(point);
+          drawCircle(gp, up.x, up.y, up.r * 0.5, "rgba(255,165,0,0.3)", "#ffa500");
+        }
+      });
+      
+      // Draw distance label
+      const start = mmToCurrentUnits({ x: activeRef.x, y: activeRef.y });
+      const end = mmToCurrentUnits(selectedMm);
+      const midX = (start.x + end.x) / 2, midY = (start.y + end.y) / 2 - start.r * 0.6;
+      drawText(gp, midX, midY, `${generatedPath.totalDistance.toFixed(2)} mm`, start.r * 1.2, "#222", "#fffb");
+    } else if (activeRef && selectedMm) {
+      // Fallback to simple line if no path generated
+      const uh = mmToCurrentUnits({ x: activeRef.x, y: activeRef.y });
+      const uf = mmToCurrentUnits(selectedMm);
+      const line = document.createElementNS(NS, "line");
+      line.setAttribute("x1", uh.x); line.setAttribute("y1", uh.y);
+      line.setAttribute("x2", uf.x); line.setAttribute("y2", uf.y);
+      line.setAttribute("stroke", "#ff0"); line.setAttribute("stroke-width", uh.r * 0.25);
+      line.setAttribute("stroke-dasharray", `${uh.r * 0.8},${uh.r * 0.6}`);
+      gm.appendChild(line);
+      
+      const dx = selectedMm.x - activeRef.x;
+      const dy = selectedMm.y - activeRef.y;
+      const dist = Math.hypot(dx, dy);
+      console.log('Distance calculation:', { dx, dy, dist, selectedMm, activeRef });
+      const midX = (uh.x + uf.x) / 2, midY = (uh.y + uf.y) / 2 - uh.r * 0.6;
+      drawText(gm, midX, midY, `${dist.toFixed(2)} mm`, uh.r * 1.2, "#222", "#fffb");
     }
 
     const gf = ensureGroup("overlay-fids");
     fiducials.forEach(f => {
       if (!f.design) return;
-      const u = mmToUnits(f.design); if (!inView(u)) return;
-      drawCircle(gf, u.x, u.y, u.r, hexToRgba(f.color, 0.20), f.color);
-      drawText(gf, u.x + u.r * 1.2, u.y - u.r * 0.8, f.id, u.r * 1.1, f.color);
+      const u = mmToCurrentUnits(f.design);
+      if (u.x >= geom.minX && u.x <= (geom.minX + geom.vbW) &&
+        u.y >= geom.minY && u.y <= (geom.minY + geom.vbH)) {
+        drawCircle(gf, u.x, u.y, u.r, hexToRgba(f.color, 0.20), f.color);
+        drawText(gf, u.x + u.r * 1.2, u.y - u.r * 0.8, f.id, u.r * 1.1, f.color);
+      }
     });
+
+    // Draw selected origin point
+    if (selectedOrigin) {
+      console.log('Drawing origin overlay:', selectedOrigin);
+      const go = ensureGroup("overlay-origin");
+      const uo = mmToCurrentUnits({ x: selectedOrigin.x, y: selectedOrigin.y });
+      console.log('Origin units:', uo, 'geom:', geom);
+      
+      // Always draw origin, ignore bounds check for debugging
+      const size = uo.r * 1.5;
+      const cross1 = document.createElementNS(NS, "line");
+      cross1.setAttribute("x1", uo.x - size); cross1.setAttribute("y1", uo.y);
+      cross1.setAttribute("x2", uo.x + size); cross1.setAttribute("y2", uo.y);
+      cross1.setAttribute("stroke", "#ff4500"); cross1.setAttribute("stroke-width", uo.r * 0.3);
+      go.appendChild(cross1);
+      
+      const cross2 = document.createElementNS(NS, "line");
+      cross2.setAttribute("x1", uo.x); cross2.setAttribute("y1", uo.y - size);
+      cross2.setAttribute("x2", uo.x); cross2.setAttribute("y2", uo.y + size);
+      cross2.setAttribute("stroke", "#ff4500"); cross2.setAttribute("stroke-width", uo.r * 0.3);
+      go.appendChild(cross2);
+      
+      drawCircle(go, uo.x, uo.y, uo.r * 0.8, "rgba(255,69,0,0.15)", "#ff4500");
+      drawText(go, uo.x + uo.r * 1.8, uo.y - uo.r * 0.8, "ORIGIN", uo.r * 1.0, "#ff4500");
+      console.log('Origin marker drawn at:', uo.x, uo.y);
+    } else {
+      console.log('No selectedOrigin to draw');
+    }
 
     if (xf) {
       const grect = ensureGroup("overlay-ghost");
-      const geom = getSvgGeom(); if (!geom) return;
       const board = [
         { x: geom.minX * geom.mmPerUnit, y: geom.minY * geom.mmPerUnit },
         { x: (geom.minX + geom.vbW) * geom.mmPerUnit, y: geom.minY * geom.mmPerUnit },
@@ -390,18 +597,17 @@ useEffect(() => {
         { x: geom.minX * geom.mmPerUnit, y: (geom.minY + geom.vbH) * geom.mmPerUnit },
       ];
       const poly = document.createElementNS(NS, "polyline");
-      const pts = board.map(p => applyTransform(xf, p)).map(mmToUnits).map(u => `${u.x},${u.y}`).join(" ");
+      const pts = board.map(p => applyTransform(xf, p)).map(mmToCurrentUnits).map(u => `${u.x},${u.y}`).join(" ");
       poly.setAttribute("points", pts + " " + pts.split(" ")[0]);
       poly.setAttribute("fill", "none");
       poly.setAttribute("stroke", "#00c4ff");
-      const u0 = mmToUnits(board[0]);
-      poly.setAttribute("stroke-width", (u0 ? u0.r : 1 / (getSvgGeom()?.mmPerUnit || 1)) * 0.25);
+      poly.setAttribute("stroke-width", (1 / geom.mmPerUnit) * 0.25);
       poly.setAttribute("stroke-dasharray", "6,6");
       grect.appendChild(poly);
     } else {
       ensureGroup("overlay-ghost");
     }
-  }, [homeMm, selectedMm, pairStats, fiducials, xf, mmToUnits, getSvgGeom]);
+  }, [selectedMm, fiducials, xf, selectedOrigin, generatedPath, pads, getSvgEl, getSvgGeom]);
 
   const hexToRgba = (hex, a = 0.3) => {
     const h = hex.replace("#", "");
@@ -411,16 +617,42 @@ useEffect(() => {
   };
 
   useEffect(() => { updateOverlay(); }, [updateOverlay]);
+  // Calculate distances from reference point to all pads
   useEffect(() => {
-    if (homeMm && selectedMm) {
-      const dx = selectedMm.x - homeMm.x;
-      const dy = selectedMm.y - homeMm.y;
-      const dist = Math.hypot(dx, dy);
-      setPairStats({ dx, dy, dist });
-    } else setPairStats(null);
-  }, [homeMm, selectedMm]);
+    const refPoint = referencePoint || selectedOrigin;
+    if (refPoint && pads.length > 0) {
+      const distances = pads.map(pad => {
+        const dx = pad.x - refPoint.x;
+        const dy = pad.y - refPoint.y;
+        const dist = Math.hypot(dx, dy);
+        return {
+          ...pad,
+          distance: dist,
+          dx,
+          dy
+        };
+      });
+      setPadDistances(distances);
+    } else {
+      setPadDistances(pads);
+    }
+  }, [referencePoint, selectedOrigin, pads]);
 
-  const PROX_MM = 5;
+  // Generate path when reference point and target change
+  useEffect(() => {
+    const refPoint = referencePoint || selectedOrigin;
+    if (refPoint && selectedMm) {
+      const path = generatePath(refPoint, selectedMm, pads, {
+        pathType,
+        avoidPads: pathType !== 'direct',
+        safeHeight: 2
+      });
+      setGeneratedPath(path);
+    } else {
+      setGeneratedPath(null);
+    }
+  }, [referencePoint, selectedOrigin, selectedMm, pads, pathType]);
+
   const getEventMm = (evt) => {
     const svgEl = getSvgEl(); if (!svgEl) return null;
     const geom = getSvgGeom(); if (!geom) return null;
@@ -430,13 +662,26 @@ useEffect(() => {
     return { x: (local.x - geom.minX) * geom.mmPerUnit, y: (local.y - geom.minY) * geom.mmPerUnit };
   };
 
-  function nearestPad(mm) {
-    let best = { comp: -1, pad: -1, d: Infinity, pos: null };
-    pads.forEach((p, pi) => {
-      const d = Math.hypot(p.x - mm.x, p.y - mm.y);
-      if (d < best.d) best = { pad: pi, d, pos: p };
-    });
-    return best.d <= PROX_MM ? best : null;
+  function isClickInsidePad(clickMm) {
+    if (pads.length === 0) {
+      console.warn('No pads loaded. Please select a paste layer from the dropdown.');
+      return null;
+    }
+    
+    for (let i = 0; i < pads.length; i++) {
+      const pad = pads[i];
+      const halfWidth = Math.max((pad.width || 1) / 2, 0.5);
+      const halfHeight = Math.max((pad.height || 1) / 2, 0.5);
+      const tolerance = 0.3;
+      
+      if (clickMm.x >= pad.x - halfWidth - tolerance && 
+          clickMm.x <= pad.x + halfWidth + tolerance &&
+          clickMm.y >= pad.y - halfHeight - tolerance && 
+          clickMm.y <= pad.y + halfHeight + tolerance) {
+        return { pad: i, pos: pad };
+      }
+    }
+    return null;
   }
 
   const [dragFid, setDragFid] = useState(null);
@@ -494,76 +739,188 @@ useEffect(() => {
     return () => obs.disconnect();
   }, [svg, updateOverlay]);
 
-  const handleCanvasClick = useCallback((evt) => {
-    if (fidPickMode) return;
-    if (zoomState.enabled) {
-      const mm = getEventMm(evt); if (!mm) return;
-      const hit = nearestPad(mm);
-      if (hit) { setSelectedMm(hit.pos); zoomToComponent(hit.pos); }
-      else if (zoomState.isZoomed) zoomOut();
-      return;
+  useEffect(() => {
+    updateOverlay();
+  }, [zoomState.isZoomed, updateOverlay]);
+
+  // Update overlay when origin changes
+  useEffect(() => {
+    if (selectedOrigin) {
+      console.log('Origin changed, updating overlay:', selectedOrigin);
+      setTimeout(() => updateOverlay(), 100); // Small delay to ensure SVG is ready
     }
+  }, [selectedOrigin, updateOverlay]);
 
-    const mm = getEventMm(evt); if (!mm) return;
-    const hit = nearestPad(mm); if (!hit) return;
 
-    if (!homeMm) {
-      const ok = window.confirm(
-        `Set this PAD as Home/origin?\n≈ X ${hit.pos.x.toFixed(2)} mm, Y ${hit.pos.y.toFixed(2)} mm`
-      );
-      if (ok) {
-        setHomeIdx(hit.pad);
-        setHomeMm({ x: hit.pos.x, y: hit.pos.y });
-        setSelectedMm(null);
+  const smoothZoom = useCallback((fromViewBox, toViewBox, duration = 300) => {
+    const svgEl = getSvgEl(); if (!svgEl) return;
+    
+    const startTime = performance.now();
+    const animate = (currentTime) => {
+      const elapsed = currentTime - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      
+      // Smooth easing function
+      const easeProgress = 1 - Math.pow(1 - progress, 3);
+      
+      const currentViewBox = {
+        minX: fromViewBox.minX + (toViewBox.minX - fromViewBox.minX) * easeProgress,
+        minY: fromViewBox.minY + (toViewBox.minY - fromViewBox.minY) * easeProgress,
+        w: fromViewBox.w + (toViewBox.w - fromViewBox.w) * easeProgress,
+        h: fromViewBox.h + (toViewBox.h - fromViewBox.h) * easeProgress
+      };
+      
+      svgEl.setAttribute("viewBox", `${currentViewBox.minX} ${currentViewBox.minY} ${currentViewBox.w} ${currentViewBox.h}`);
+      
+      if (progress < 1) {
+        requestAnimationFrame(animate);
+      } else {
+        updateOverlay();
       }
-      return;
-    }
-
-    const measure = window.confirm(
-      `Measure distance from HOME to this PAD?\n≈ X ${hit.pos.x.toFixed(2)} mm, Y ${hit.pos.y.toFixed(2)} mm`
-    );
-    if (measure) {
-      setSelectedMm({ x: hit.pos.x, y: hit.pos.y });
-    }
-  }, [
-    fidPickMode,
-    zoomState.enabled, zoomState.isZoomed,
-    homeMm,
-    pads
-  ]);
+    };
+    
+    requestAnimationFrame(animate);
+  }, [getSvgEl, updateOverlay]);
 
   const zoomToComponent = useCallback((ptMm) => {
     const svgEl = getSvgEl(); if (!svgEl) return;
     const viewBoxAttr = svgEl.getAttribute("viewBox"); if (!viewBoxAttr) return;
     const [minX, minY, w, h] = viewBoxAttr.split(/\s+/).map(Number);
-    if (!zoomState.baseViewBox) setZoomState(prev => ({ ...prev, baseViewBox: { minX, minY, w, h } }));
+    const currentViewBox = { minX, minY, w, h };
+    
+    if (!zoomState.baseViewBox) {
+      setZoomState(prev => ({ ...prev, baseViewBox: currentViewBox }));
+    }
 
     const geom = getSvgGeom(); if (!geom) return;
     const cx = ptMm.x / geom.mmPerUnit + geom.minX;
     const cy = ptMm.y / geom.mmPerUnit + geom.minY;
 
+    const nextZoomLevel = Math.min(zoomState.zoomLevel + 1, zoomState.maxZoomLevel);
+    const zoomFactor = Math.pow(2, nextZoomLevel); // 2x, 4x, 8x
+    
     const paddingUnits = zoomState.zoomPadding / geom.mmPerUnit;
     const cont = getCanvas();
     const ar = (cont?.clientWidth || 1) / (cont?.clientHeight || 1);
-    let newW = (w / 1.8) + paddingUnits * 2;
+    const baseViewBox = zoomState.baseViewBox || currentViewBox;
+    
+    let newW = (baseViewBox.w / zoomFactor) + paddingUnits * 2;
     let newH = newW / ar;
-    const base = zoomState.baseViewBox || { minX, minY, w, h };
-    let newMinX = Math.max(Math.min(cx - newW / 2, base.minX + base.w - newW), base.minX);
-    let newMinY = Math.max(Math.min(cy - newH / 2, base.minY + base.h - newH), base.minY);
-    svgEl.setAttribute("viewBox", `${newMinX} ${newMinY} ${newW} ${newH}`);
-    setZoomState(prev => ({ ...prev, isZoomed: true }));
-
-    updateOverlay();
-  }, [getSvgEl, getSvgGeom, zoomState.baseViewBox, zoomState.zoomPadding, updateOverlay]);
+    
+    let newMinX = Math.max(Math.min(cx - newW / 2, baseViewBox.minX + baseViewBox.w - newW), baseViewBox.minX);
+    let newMinY = Math.max(Math.min(cy - newH / 2, baseViewBox.minY + baseViewBox.h - newH), baseViewBox.minY);
+    
+    const targetViewBox = { minX: newMinX, minY: newMinY, w: newW, h: newH };
+    
+    smoothZoom(currentViewBox, targetViewBox);
+    setZoomState(prev => ({ ...prev, isZoomed: true, zoomLevel: nextZoomLevel }));
+  }, [getSvgEl, getSvgGeom, zoomState.baseViewBox, zoomState.zoomLevel, zoomState.maxZoomLevel, zoomState.zoomPadding, getCanvas, smoothZoom]);
 
   const zoomOut = useCallback(() => {
-    const svgEl = getSvgEl(); if (!svgEl || !zoomState.baseViewBox) return;
-    const { minX, minY, w, h } = zoomState.baseViewBox;
-    svgEl.setAttribute("viewBox", `${minX} ${minY} ${w} ${h}`);
-    setZoomState(prev => ({ ...prev, isZoomed: false }));
+    const svgEl = getSvgEl(); if (!svgEl) return;
+    
+    if (zoomState.zoomLevel > 0) {
+      // Step back one zoom level
+      const viewBoxAttr = svgEl.getAttribute("viewBox");
+      if (!viewBoxAttr) return;
+      const [minX, minY, w, h] = viewBoxAttr.split(/\s+/).map(Number);
+      const currentViewBox = { minX, minY, w, h };
+      
+      const prevZoomLevel = zoomState.zoomLevel - 1;
+      const baseViewBox = zoomState.baseViewBox;
+      if (!baseViewBox) return;
+      
+      let targetViewBox;
+      if (prevZoomLevel === 0) {
+        // Back to original view
+        targetViewBox = baseViewBox;
+      } else {
+        // Calculate intermediate zoom level
+        const zoomFactor = Math.pow(2, prevZoomLevel);
+        const paddingUnits = zoomState.zoomPadding / (getSvgGeom()?.mmPerUnit || 1);
+        const cont = getCanvas();
+        const ar = (cont?.clientWidth || 1) / (cont?.clientHeight || 1);
+        
+        const centerX = currentViewBox.minX + currentViewBox.w / 2;
+        const centerY = currentViewBox.minY + currentViewBox.h / 2;
+        
+        let newW = (baseViewBox.w / zoomFactor) + paddingUnits * 2;
+        let newH = newW / ar;
+        
+        targetViewBox = {
+          minX: Math.max(Math.min(centerX - newW / 2, baseViewBox.minX + baseViewBox.w - newW), baseViewBox.minX),
+          minY: Math.max(Math.min(centerY - newH / 2, baseViewBox.minY + baseViewBox.h - newH), baseViewBox.minY),
+          w: newW,
+          h: newH
+        };
+      }
+      
+      smoothZoom(currentViewBox, targetViewBox);
+      setZoomState(prev => ({ 
+        ...prev, 
+        isZoomed: prevZoomLevel > 0, 
+        zoomLevel: prevZoomLevel 
+      }));
+    }
+  }, [getSvgEl, zoomState.baseViewBox, zoomState.zoomLevel, zoomState.zoomPadding, getCanvas, getSvgGeom, smoothZoom]);
 
-    updateOverlay();
-  }, [getSvgEl, zoomState.baseViewBox, updateOverlay]);
+  const handleCanvasClick = useCallback((evt) => {
+    if (fidPickMode) return;
+
+    const mm = getEventMm(evt);
+    if (!mm) return;
+    
+    const hit = isClickInsidePad(mm);
+    
+    // Only process clicks inside actual pad boundaries
+    if (!hit) {
+      // Clear selection when clicking outside pads
+      setSelectedMm(null);
+      return;
+    }
+
+    if (zoomState.enabled) {
+      setSelectedMm(hit.pos);
+      if (zoomState.zoomLevel < zoomState.maxZoomLevel) {
+        zoomToComponent(hit.pos);
+      } else {
+        zoomOut();
+      }
+      return;
+    }
+
+    // Always use pad center coordinates, not click coordinates
+    const padCenter = { x: hit.pos.x, y: hit.pos.y };
+    
+    // Show distance from reference point to clicked pad
+    const refPoint = referencePoint || selectedOrigin;
+    if (refPoint) {
+      const dx = padCenter.x - refPoint.x;
+      const dy = padCenter.y - refPoint.y;
+      const dist = Math.hypot(dx, dy);
+      const refName = refPoint === selectedOrigin ? 'PCB Origin' : `Fiducial ${refPoint.id || ''}`;
+      const show = window.confirm(
+        `Distance from ${refName}:\n` +
+        `ΔX: ${dx.toFixed(2)} mm\n` +
+        `ΔY: ${dy.toFixed(2)} mm\n` +
+        `Distance: ${dist.toFixed(2)} mm\n\n` +
+        `Show measurement line?`
+      );
+      if (show) {
+        setSelectedMm(padCenter);
+      }
+    } else {
+      setSelectedMm(padCenter);
+    }
+  }, [
+    fidPickMode,
+    zoomState.enabled, zoomState.isZoomed,
+    selectedOrigin,
+    pads,
+    getEventMm,
+    zoomToComponent,
+    zoomOut
+  ]);
 
   const onInputMachine = (id, partial) => {
     setFiducials(prev => prev.map(f => f.id === id ? { ...f, machine: { x: (partial.x ?? f.machine?.x ?? null), y: (partial.y ?? f.machine?.y ?? null) } } : f));
@@ -584,17 +941,137 @@ useEffect(() => {
     setXf(T);
   };
 
+  const onRedetectFiducials = () => {
+    if (layers.length === 0) return;
+
+    // Re-run fiducial detection
+    const detectedFiducials = analyzeFiducialsInLayers(layers);
+    setFiducialDetectionResult(detectedFiducials);
+
+    if (detectedFiducials.length > 0) {
+      // Auto-populate fiducials with detected positions
+      const colors = ["#2ea8ff", "#8e2bff", "#00c49a", "#ff6b35", "#9c27b0", "#4caf50"];
+      const autoFiducials = detectedFiducials.map((fid, idx) => ({
+        id: fid.id,
+        design: { x: fid.x, y: fid.y },
+        machine: null,
+        color: colors[idx % colors.length],
+        confidence: fid.confidence
+      }));
+
+      // Fill remaining slots with empty fiducials
+      while (autoFiducials.length < 3) {
+        autoFiducials.push({
+          id: `F${autoFiducials.length + 1}`,
+          design: null,
+          machine: null,
+          color: colors[autoFiducials.length % colors.length]
+        });
+      }
+
+      setFiducials(autoFiducials);
+    } else {
+      // No fiducials detected, keep current fiducials but clear design positions
+      setFiducials(prev => prev.map(f => ({ ...f, design: null })));
+    }
+
+    // Clear transform since fiducials changed
+    setXf(null);
+  };
+
+  const onAutoAlign = () => {
+    // Auto-populate machine coordinates from design coordinates
+    const alignedFiducials = fiducials.map(f => {
+      if (f.design && f.design.x !== null && f.design.y !== null) {
+        return {
+          ...f,
+          machine: {
+            x: f.design.x + (pcbOriginOffset?.x || 0) + (toolOffset?.dx || 0),
+            y: f.design.y + (pcbOriginOffset?.y || 0) + (toolOffset?.dy || 0)
+          }
+        };
+      }
+      return f;
+    });
+
+    setFiducials(alignedFiducials);
+
+    // Auto-solve transformation if we have enough fiducials
+    const validFiducials = alignedFiducials.filter(f => f.design && f.machine);
+    if (validFiducials.length >= 2) {
+      const T = fitSimilarity(validFiducials.map(f => f.design), validFiducials.map(f => f.machine));
+      setXf(T);
+    }
+  };
+
+  const onAutoDetectCamera = async () => {
+    // This will be called from CameraPanel when fiducials are detected
+    console.log('Camera-based fiducial detection initiated');
+  };
+
+  const onDetectOrigins = () => {
+    if (layers.length === 0) return;
+    
+    const origins = detectPcbOrigins(layers);
+    setOriginCandidates(origins);
+    
+    if (origins.length > 0) {
+      const origin = { ...origins[0], id: 'O1' };
+      setSelectedOrigin(origin);
+      setPcbOriginOffset({ x: origin.x, y: origin.y });
+    } else {
+      setSelectedOrigin(null);
+    }
+  };
+  useEffect(() => {
+    window.updateFiducialsFromCamera = (detectedFiducials) => {
+      const colors = ["#2ea8ff", "#8e2bff", "#00c49a", "#ff6b35", "#9c27b0", "#4caf50"];
+      
+      const updatedFiducials = detectedFiducials.map((detected, idx) => ({
+        id: detected.id || `F${idx + 1}`,
+        design: fiducials[idx]?.design || null, // Keep existing design coordinates
+        machine: detected.machine,
+        color: colors[idx % colors.length],
+        confidence: detected.confidence,
+        autoDetected: true
+      }));
+      
+      // Fill remaining slots
+      while (updatedFiducials.length < 3) {
+        updatedFiducials.push({
+          id: `F${updatedFiducials.length + 1}`,
+          design: null,
+          machine: null,
+          color: colors[updatedFiducials.length % colors.length]
+        });
+      }
+      
+      setFiducials(updatedFiducials);
+      
+      // Auto-solve if we have enough data
+      const validFiducials = updatedFiducials.filter(f => f.design && f.machine);
+      if (validFiducials.length >= 2) {
+        const T = fitSimilarity(validFiducials.map(f => f.design), validFiducials.map(f => f.machine));
+        setXf(T);
+      }
+    };
+    
+    return () => {
+      delete window.updateFiducialsFromCamera;
+    };
+  }, [fiducials]);
+
   return (
     <div className="wrap" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
       <aside className="sidebar">
-        <div className="header">
+        <div className="header" >
           <div className="row" style={{ marginBottom: 12 }}>
             <label className="btn">
               Open Gerbers / ZIP
               <input type="file" multiple onChange={pickFiles}
-                accept=".zip,.gbr,.grb,.gtl,.gbl,.gts,.gbs,.gto,.gbo,.gtp,.gbp,.gm1,.drl,.txt,.nc" />
+                accept=".zip,.gbr,.grb,.gtl,.gbl,.gts,.gbs,.gto,.gbo,.gtp,.gbp,.gbc,.gm1,.drl,.txt,.nc" />
             </label>
-            <button className="btn secondary" onClick={exportAllSvgsZip}>Download SVGs (ZIP)</button>
+            <button className="btn secondary" onClick={exportAllSvgsZip} disabled={layers.length === 0}>Download SVGs (ZIP)</button>
           </div>
           <div className="row" style={{ gap: 8 }}>
             <button className="btn sm" onClick={handleUndo} disabled={!undoManager.canUndo()} title="Undo">
@@ -606,9 +1083,9 @@ useEffect(() => {
           </div>
         </div>
 
-        <div className="section">
-          <h3>Board View</h3>
-          <div className="row">
+        <div className="section Board-section">
+          <h3 style={{ color: '#007bff', padding: '8px 12px', borderBottom: '2px solid #007bff' }}>Board View</h3>
+          <div className="flex-row">
             <button className="btn secondary" onClick={() => changeSide("top")}>Top</button>
             <button className="btn secondary" onClick={() => changeSide("bottom")}>Bottom</button>
             <label><input type="checkbox" checked={mirrorBottom} onChange={(e) => setMirrorBottom(e.target.checked)} /> Mirror bottom</label>
@@ -616,52 +1093,133 @@ useEffect(() => {
           <LayerList layers={layers} onToggle={toggleLayer} />
         </div>
 
-        <div className="section">
-          <h3>G-code</h3>
-          <div className="row">
-            <button className="btn" onClick={() => exportAllGcodeZip("marlin")}>Export G-code (Marlin ZIP)</button>
-            <button className="btn secondary" onClick={() => exportAllGcodeZip("grbl")}>Export G-code (GRBL ZIP)</button>
-            <button className="btn" onClick={() => exportAllGcodeZip("creality")}>
+        <div className="section Gcode-section">
+          <h3 style={{ color: '#007bff', padding: '8px 12px', borderBottom: '2px solid #007bff' }}>G-code</h3>
+          <div className="flex-row">
+            <button className="btn" onClick={() => exportAllGcodeZip("marlin")} disabled={layers.length === 0}>Export G-code (Marlin ZIP)</button>
+            <button className="btn secondary" onClick={() => exportAllGcodeZip("grbl")} disabled={layers.length === 0}>Export G-code (GRBL ZIP)</button>
+            <button className="btn" onClick={() => exportAllGcodeZip("creality")} disabled={layers.length === 0}>
               Export G-code (Creality FDM ZIP)
             </button>
           </div>
         </div>
 
-        <div className="section">
-          <h3>Components</h3>
-          <div className="row">
+        <div className="section Components-section">
+          <h3 style={{ color: '#007bff', padding: '8px 12px', borderBottom: '2px solid #007bff' }}>Components</h3>
+          <div className="flex-row" style={{ marginLeft: 8 }}>
             <select value={pasteIdx ?? ""} onChange={(e) => {
               const idx = e.target.value === "" ? null : +e.target.value;
               setPasteIdx(idx);
               if (idx != null) {
-                const padData = extractPadsMm(layers[idx].text).map(padCenter);
-                setPads(processPads(padData));
+                const selectedSide = layers[idx].side || side;
+                const combinedData = combinePadLayers(layers, selectedSide);
+                setPads(processPads(combinedData.pads.map(padCenter)));
+                console.log('Combined pad data:', combinedData);
               } else setPads([]);
-              setSelectedMm(null); setHomeMm(null);
+              setSelectedMm(null);
             }}>
-              <option value="">(select paste layer)</option>
-              {layers.map((l, i) => l.type === "solderpaste" ? <option key={l.filename} value={i}>{l.filename}</option> : null)}
+              <option value="">(select layer combination)</option>
+              {layers.map((l, i) => {
+                if (l.type === "solderpaste") {
+                  const combo = getAvailableLayerCombinations(layers, l.side);
+                  const label = combo.canCombine ? 
+                    `${l.filename} + soldermask (combined)` : 
+                    `${l.filename} (paste only)`;
+                  return <option key={l.filename} value={i}>{label}</option>;
+                }
+                return null;
+              })}
             </select>
           </div>
           <ComponentList
-            components={pads}
-            originIdx={homeIdx}
-            onSetHome={(i) => {
-              const pad = pads[i]; if (!pad) return;
-              saveStateForUndo('Set home position');
-              setHomeIdx(i); setHomeMm({ x: pad.x, y: pad.y });
-            }}
+            components={padDistances}
             onFocus={(pad) => {
               setSelectedMm({ x: pad.x, y: pad.y });
             }}
           />
-          
-          <div className="section">
+
+          {/* <div className="section">
             <h3>Advanced Features</h3>
-            <div className="row wrap" style={{ gap: 8 }}>
+            <div className="flex-row wrap" style={{ gap: 8 }}>
               <label><input type="checkbox" checked={visionEnabled} onChange={(e) => setVisionEnabled(e.target.checked)} /> Vision Guidance</label>
               <label><input type="checkbox" checked={qualityEnabled} onChange={(e) => setQualityEnabled(e.target.checked)} /> Quality Control</label>
             </div>
+          </div> */}
+
+          <div className="section Origin-section">
+            <h3 style={{ color: '#007bff', padding: '8px 12px', borderBottom: '2px solid #007bff' }}>PCB Origin</h3>
+            {selectedOrigin && (
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ padding: 8, background: '#e3effaff', borderRadius: 4 }}>
+                  <strong>{selectedOrigin.description}</strong><br/>
+                  <small>Position: ({selectedOrigin.x.toFixed(2)}, {selectedOrigin.y.toFixed(2)}) mm</small>
+                  <small>Confidence: {(selectedOrigin.confidence * 100).toFixed(0)}%</small>
+                </div>
+              </div>
+            )}
+            <div className="flex-row" style={{ marginLeft: 8 }}>
+              <label>X (mm) <input type="number" step="0.1" value={pcbOriginOffset?.x || 0}
+                onChange={(e) => setPcbOriginOffset({ x: +e.target.value || 0, y: pcbOriginOffset?.y || 0 })}
+                style={{ width: 80 }} /></label>
+              <label>Y (mm) <input type="number" step="0.1" value={pcbOriginOffset?.y || 0}
+                onChange={(e) => setPcbOriginOffset({ x: pcbOriginOffset?.x || 0, y: +e.target.value || 0 })}
+                style={{ width: 80 }} /></label>
+            </div>
+            <div className="flex-row" style={{ gap: 8, marginTop: 8 }}>
+              <button className="btn sm secondary" onClick={onDetectOrigins} disabled={layers.length === 0}>
+                🎯 Detect Origins
+              </button>
+              <button className="btn sm secondary" onClick={() => {
+                // Test origin at fixed position
+                const testOrigin = { id: 'O1', x: 0, y: 0, confidence: 0.9, description: 'Test origin' };
+                setSelectedOrigin(testOrigin);
+                console.log('Set test origin:', testOrigin);
+                setTimeout(() => updateOverlay(), 100);
+              }}>
+                Test Origin
+              </button>
+              <button className="btn sm secondary" onClick={() => {
+                setSelectedOrigin(null);
+                setPcbOriginOffset({ x: 0, y: 0 });
+              }}>
+                Clear
+              </button>
+            </div>
+            <small>Machine coordinates where PCB design origin (0,0) is located</small>
+          </div>
+          
+          <div className="section Reference-section" style={{ marginTop: 16 }}>
+            <h4 style={{ color: '#007bff', margin: '8px 0' }}>Reference Point</h4>
+            <div className="flex-row" style={{ marginLeft: 8, gap: 8 }}>
+              <label>
+                <input type="radio" name="refType" checked={referenceType === 'origin'} 
+                  onChange={() => {
+                    setReferenceType('origin');
+                    setReferencePoint(null);
+                  }} />
+                PCB Origin
+              </label>
+              <label>
+                <input type="radio" name="refType" checked={referenceType === 'fiducial'} 
+                  onChange={() => setReferenceType('fiducial')} />
+                Fiducial
+              </label>
+            </div>
+            {referenceType === 'fiducial' && (
+              <div className="flex-row" style={{ marginLeft: 8, marginTop: 8 }}>
+                <select value={referencePoint?.id || ''} onChange={(e) => {
+                  const fidId = e.target.value;
+                  const fid = fiducials.find(f => f.id === fidId && f.design);
+                  setReferencePoint(fid ? { x: fid.design.x, y: fid.design.y, id: fid.id } : null);
+                }}>
+                  <option value="">(select fiducial)</option>
+                  {fiducials.filter(f => f.design).map(f => (
+                    <option key={f.id} value={f.id}>{f.id} ({f.design.x.toFixed(1)}, {f.design.y.toFixed(1)})</option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <small>Reference point for measuring distances to pads</small>
           </div>
         </div>
       </aside>
@@ -680,13 +1238,26 @@ useEffect(() => {
           onZoomOut={zoomOut}
         />
 
-        {pairStats && (
+        {(referencePoint || selectedOrigin) && selectedMm && (
           <div className="distance-info">
-            <span className="badge">Distance</span>
+            <span className="badge">Path from {referencePoint ? `Fiducial ${referencePoint.id}` : 'PCB Origin'}</span>
             <div className="kvs">
-              <span>ΔX: {pairStats.dx.toFixed(2)} mm</span>
-              <span>ΔY: {pairStats.dy.toFixed(2)} mm</span>
-              <span><strong>{pairStats.dist.toFixed(2)} mm</strong></span>
+              <span>ΔX: {(selectedMm.x - (referencePoint || selectedOrigin).x).toFixed(2)} mm</span>
+              <span>ΔY: {(selectedMm.y - (referencePoint || selectedOrigin).y).toFixed(2)} mm</span>
+              <span><strong>2D: {Math.hypot(selectedMm.x - (referencePoint || selectedOrigin).x, selectedMm.y - (referencePoint || selectedOrigin).y).toFixed(2)} mm</strong></span>
+              {generatedPath && <span>3D Path: {generatedPath.totalDistance.toFixed(2)} mm</span>}
+            </div>
+            <div className="path-controls" style={{ marginTop: 8 }}>
+              <select value={pathType} onChange={(e) => setPathType(e.target.value)} style={{ fontSize: 12 }}>
+                <option value="direct">Direct Path</option>
+                <option value="safe">Safe Path (Lift)</option>
+                <option value="optimized">Optimized Path</option>
+              </select>
+              {generatedPath && (
+                <small style={{ marginLeft: 8, color: '#666' }}>
+                  {generatedPath.type} • {generatedPath.segments.length} segments
+                </small>
+              )}
             </div>
           </div>
         )}
@@ -706,20 +1277,35 @@ useEffect(() => {
             transformSummary={transformSummary}
             applyTransform={applyXf}
             setApplyTransform={setApplyXf}
+            detectionResult={fiducialDetectionResult}
+            onRedetectFiducials={onRedetectFiducials}
+            onAutoAlign={onAutoAlign}
+            onAutoDetectCamera={onAutoDetectCamera}
           />
+          {selectedOrigin && selectedMm && xf && applyXf && (
+            <div style={{ padding: 8, background: '#f8f9fa', border: '1px solid #dee2e6', borderRadius: 4, marginTop: 8 }}>
+              <small><strong>Transform Verification:</strong></small>
+              <div style={{ fontSize: '0.8em', fontFamily: 'monospace' }}>
+                Origin: {selectedOrigin.x.toFixed(3)}, {selectedOrigin.y.toFixed(3)} → {verifyTransform(selectedOrigin).x.toFixed(3)}, {verifyTransform(selectedOrigin).y.toFixed(3)}
+              </div>
+              <div style={{ fontSize: '0.8em', fontFamily: 'monospace' }}>
+                Target: {selectedMm.x.toFixed(3)}, {selectedMm.y.toFixed(3)} → {verifyTransform(selectedMm).x.toFixed(3)}, {verifyTransform(selectedMm).y.toFixed(3)}
+              </div>
+            </div>
+          )}
         </div>
 
         {maintenanceAlert && (
-          <div className="maintenance-alert" style={{ 
-            position: 'fixed', top: 20, right: 20, background: '#ff6b35', color: 'white', 
-            padding: 16, borderRadius: 8, zIndex: 1000, maxWidth: 300 
+          <div className="maintenance-alert" style={{
+            position: 'fixed', top: 20, right: 20, background: '#ff6b35', color: 'white',
+            padding: 16, borderRadius: 8, zIndex: 1000, maxWidth: 300
           }}>
             <h4>🔧 Nozzle Maintenance Required</h4>
-            <p>{maintenanceAlert.type === 'cleaning_reminder' ? 
+            <p>{maintenanceAlert.type === 'cleaning_reminder' ?
               `Dispenses: ${maintenanceAlert.dispenseCount}, Hours: ${Math.round(maintenanceAlert.hoursSinceLastCleaning)}` :
               'Cleaning completed'}
             </p>
-            <div className="row" style={{ gap: 8, marginTop: 8 }}>
+            <div className="flex-row" style={{ gap: 8, marginTop: 8 }}>
               <button className="btn sm" onClick={() => {
                 maintenanceManager.markCleaned();
                 setMaintenanceAlert(null);
@@ -730,22 +1316,21 @@ useEffect(() => {
         )}
 
         <div className="panels">
-          <CameraPanel 
-          fiducials={fiducials}
-          xf={xf}
-          applyXf={applyXf}
-          selectedDesign={selectedMm}
-          toolOffset={toolOffset}
-          setToolOffset={(setToolOffset)}
-          nozzleDia={nozzleDia}
-          setNozzleDia={setNozzleDia}
-          visionEnabled={visionEnabled}
-          qualityEnabled={qualityEnabled}
-          padDetector={padDetector}
-          qualityController={qualityController}
+          <CameraPanel
+            fiducials={fiducials}
+            xf={xf}
+            applyXf={applyXf}
+            selectedDesign={selectedMm}
+            toolOffset={toolOffset}
+            setToolOffset={(setToolOffset)}
+            nozzleDia={nozzleDia}
+            setNozzleDia={setNozzleDia}
+            padDetector={padDetector}
+            qualityController={qualityController}
+            fiducialVisionDetector={fiducialVisionDetector}
           />
           <LinearMovePanel
-            homeDesign={homeMm}
+            homeDesign={selectedOrigin ? { x: selectedOrigin.x, y: selectedOrigin.y } : null}
             focusDesign={selectedMm}
             xf={xf}
             applyXf={applyXf}
