@@ -1,4 +1,3 @@
-// LinearMovePanel.jsx - Improved version with better layout
 import { useEffect, useRef, useMemo, useState } from "react";
 import { applyTransform } from "../lib/utils/transform2d";
 import "./LinearMovePanel.css";
@@ -11,7 +10,9 @@ export default function LinearMovePanel({
   components = [],
   axisLetter = "A",
   collisionDetector,
-  maintenanceManager
+  maintenanceManager,
+  pressureController,
+  pressureSettings
 }) {
   const toMachine = (pt) => {
     if (!pt) return null;
@@ -118,6 +119,17 @@ export default function LinearMovePanel({
     g.push("; --- linearMovePanel (valve actuator) ---");
     g.push("G21");
     g.push("G90");
+    
+    // Add pressure control setup
+    if (pressureController && pressureSettings) {
+      const padSize = { width: 1, height: 1 }; // Default pad size
+      const pressure = pressureSettings.viscosity === 'custom' 
+        ? pressureSettings.customPressure
+        : pressureController.calculatePressure(padSize, pressureSettings.viscosity);
+      
+      const pressureGcode = pressureController.generatePressureGcode(pressure, pressureSettings.viscosity);
+      g.push(...pressureGcode);
+    }
 
     // Check for collisions and generate safe path if needed
     let safePath = segs;
@@ -146,7 +158,17 @@ export default function LinearMovePanel({
 
     g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
     g.push(valveOn);
-    g.push(`G4 P${Math.max(0, Math.round(dwellMs))}`);
+    
+    // Use pressure-adjusted dwell time
+    let adjustedDwellMs = dwellMs;
+    if (pressureController && pressureSettings) {
+      const padSize = { width: 1, height: 1 };
+      adjustedDwellMs = pressureSettings.viscosity === 'custom'
+        ? pressureSettings.customDwellTime
+        : pressureController.calculateDwellTime(padSize, pressureSettings.viscosity);
+    }
+    
+    g.push(`G4 P${Math.max(0, Math.round(adjustedDwellMs))}`);
     g.push(valveOff);
     g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
 
@@ -178,11 +200,32 @@ export default function LinearMovePanel({
     for (const dPad of pads) {
       const mPad = toMachine(dPad);
       if (!mPad) continue;
+      
+      // Calculate pressure and dwell time for this specific pad
+      let padPressure = 25; // default
+      let padDwellTime = dwellMs;
+      
+      if (pressureController && pressureSettings) {
+        const padSize = { width: dPad.width || 1, height: dPad.height || 1 };
+        
+        if (pressureSettings.viscosity === 'custom') {
+          padPressure = pressureSettings.customPressure;
+          padDwellTime = pressureSettings.customDwellTime;
+        } else {
+          padPressure = pressureController.calculatePressure(padSize, pressureSettings.viscosity);
+          padDwellTime = pressureController.calculateDwellTime(padSize, pressureSettings.viscosity);
+        }
+        
+        // Add pressure adjustment for this pad
+        const pressureGcode = pressureController.generatePressureGcode(padPressure, pressureSettings.viscosity);
+        g.push(...pressureGcode);
+      }
+      
       g.push(`G1 X${fmt(mPad.x)} Y${fmt(mPad.y)} F${fmt(feedXY, 0)}`);
       if (isFinite(rotDeg) && rotDeg !== 0) g.push(`G0 ${axisLetter}${fmt(rotDeg, 2)}`);
       g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
       g.push(valveOn);
-      g.push(`G4 P${Math.max(0, Math.round(dwellMs))}`);
+      g.push(`G4 P${Math.max(0, Math.round(padDwellTime))}`);
       g.push(valveOff);
       g.push(`G1 Z${fmt(zsafe)} F${fmt(Vz * 60, 0)}`);
     }

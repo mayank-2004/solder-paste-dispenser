@@ -9,6 +9,7 @@ import SerialPanel from "./components/SerialPanel.jsx";
 import ComponentList from "./components/ComponentList.jsx";
 import LinearMovePanel from "./components/LinearMovePanel.jsx";
 import FiducialPanel from "./components/FiducialPanel.jsx";
+import PressurePanel from "./components/PressurePanel.jsx";
 import { identifyLayers } from "./lib/gerber/identifyLayers.js";
 import { stackupToSvg } from "./lib/gerber/stackupToSvg.js";
 import { extractPadsMm } from "./lib/gerber/extractPads.js";
@@ -25,6 +26,7 @@ import { UndoRedoManager } from "./lib/history/undoRedo.js";
 import { NozzleMaintenanceManager } from "./lib/maintenance/nozzleMaintenance.js";
 import { generatePath } from "./lib/motion/pathGeneration.js";
 import { combinePadLayers, getAvailableLayerCombinations } from "./lib/gerber/padCombiner.js";
+import { PressureController, VISCOSITY_TYPES } from "./lib/pressure/pressureControl.js";
 
 function padCenter(p) {
   if (typeof p.cx === "number" && typeof p.cy === "number") return { x: p.cx, y: p.cy };
@@ -103,6 +105,7 @@ export default function App() {
   const [undoManager] = useState(() => new UndoRedoManager());
   const [maintenanceManager] = useState(() => new NozzleMaintenanceManager());
   const [fiducialVisionDetector] = useState(() => new FiducialVisionDetector());
+  const [pressureController] = useState(() => new PressureController());
   // const [visionEnabled, setVisionEnabled] = useState(false);
   // const [qualityEnabled, setQualityEnabled] = useState(false);
   const [maintenanceAlert, setMaintenanceAlert] = useState(null);
@@ -188,9 +191,21 @@ export default function App() {
     }
   });
 
+  const [pressureSettings, setPressureSettings] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("pressureSettings") || '{"viscosity": "medium", "customPressure": 25, "customDwellTime": 120}');
+    } catch (error) {
+      return { viscosity: "medium", customPressure: 25, customDwellTime: 120 };
+    }
+  });
+
   useEffect(() => {
     localStorage.setItem("nozzleDia", JSON.stringify(nozzleDia));
   }, [nozzleDia]);
+
+  useEffect(() => {
+    localStorage.setItem("pressureSettings", JSON.stringify(pressureSettings));
+  }, [pressureSettings]);
 
   const transformSummary = useMemo(() => {
     if (!xf) return null;
@@ -1329,6 +1344,12 @@ export default function App() {
             qualityController={qualityController}
             fiducialVisionDetector={fiducialVisionDetector}
           />
+          <PressurePanel
+            pressureController={pressureController}
+            pressureSettings={pressureSettings}
+            setPressureSettings={setPressureSettings}
+            selectedPad={selectedMm ? pads.find(p => Math.abs(p.x - selectedMm.x) < 0.1 && Math.abs(p.y - selectedMm.y) < 0.1) : null}
+          />
           <LinearMovePanel
             homeDesign={selectedOrigin ? { x: selectedOrigin.x, y: selectedOrigin.y } : null}
             focusDesign={selectedMm}
@@ -1338,6 +1359,8 @@ export default function App() {
             axisLetter="A"
             collisionDetector={collisionDetector}
             maintenanceManager={maintenanceManager}
+            pressureController={pressureController}
+            pressureSettings={pressureSettings}
           />
           <SerialPanel />
         </div>
