@@ -7,10 +7,10 @@ export function detectPcbOrigins(layers) {
   // Only find bottom-left corner from board outline
   const outlineOrigins = findOutlineOrigins(layers);
   
-  // Filter to only bottom-left corner with 90% confidence
-  const bottomLeftOrigin = outlineOrigins.find(o => o.subtype === 'bottom_left');
+  // Filter to only top-left corner with 90% confidence
+  const topLeftOrigin = outlineOrigins.find(o => o.subtype === 'top_left');
   
-  return bottomLeftOrigin ? [bottomLeftOrigin] : [];
+  return topLeftOrigin ? [topLeftOrigin] : [];
 }
 
 /**
@@ -29,15 +29,15 @@ function findOutlineOrigins(layers) {
   for (const layer of outlineLayers) {
     const bounds = extractBounds(layer.text);
     if (bounds) {
-      // Bottom-left corner (most common PCB origin)
-      // In SVG coordinate system, Y increases downward, so maxY is bottom
+      // Top-left corner (new PCB origin)
+      // In SVG coordinate system, Y increases downward, so minY is top
       origins.push({
         x: bounds.minX,
-        y: bounds.maxY, // Use maxY for bottom in SVG coordinates
+        y: bounds.minY, // Use minY for top in SVG coordinates
         type: 'outline_corner',
-        subtype: 'bottom_left',
+        subtype: 'top_left',
         confidence: 0.9,
-        description: 'Bottom-left corner of PCB outline'
+        description: 'Top-left corner of PCB outline'
       });
     }
   }

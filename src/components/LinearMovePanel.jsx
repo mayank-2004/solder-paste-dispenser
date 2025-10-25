@@ -12,7 +12,9 @@ export default function LinearMovePanel({
   collisionDetector,
   maintenanceManager,
   pressureController,
-  pressureSettings
+  pressureSettings,
+  speedProfileManager,
+  speedSettings
 }) {
   const toMachine = (pt) => {
     if (!pt) return null;
@@ -159,13 +161,25 @@ export default function LinearMovePanel({
     g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
     g.push(valveOn);
     
-    // Use pressure-adjusted dwell time
+    // Use pressure-adjusted dwell time and speed profiles
     let adjustedDwellMs = dwellMs;
+    let feedXY = Math.min(Vx, Vy) * 60;
+    
     if (pressureController && pressureSettings) {
       const padSize = { width: 1, height: 1 };
       adjustedDwellMs = pressureSettings.viscosity === 'custom'
         ? pressureSettings.customDwellTime
         : pressureController.calculateDwellTime(padSize, pressureSettings.viscosity);
+    }
+    
+    // Apply speed profile if enabled
+    if (speedProfileManager && speedSettings?.autoAdjust) {
+      const padSize = { width: 1, height: 1 };
+      const speedProfile = speedProfileManager.calculateOptimalSpeeds(padSize, pressureSettings?.viscosity);
+      feedXY = speedProfile.speeds.dispense * (speedSettings.globalMultiplier || 1.0);
+      
+      const speedGcode = speedProfileManager.generateSpeedGcode(speedProfile.speeds, "Speed profile for current pad");
+      g.push(...speedGcode);
     }
     
     g.push(`G4 P${Math.max(0, Math.round(adjustedDwellMs))}`);
@@ -201,13 +215,14 @@ export default function LinearMovePanel({
       const mPad = toMachine(dPad);
       if (!mPad) continue;
       
-      // Calculate pressure and dwell time for this specific pad
+      // Calculate pressure, dwell time, and speeds for this specific pad
       let padPressure = 25; // default
       let padDwellTime = dwellMs;
+      let padFeedXY = feedXY;
+      
+      const padSize = { width: dPad.width || 1, height: dPad.height || 1 };
       
       if (pressureController && pressureSettings) {
-        const padSize = { width: dPad.width || 1, height: dPad.height || 1 };
-        
         if (pressureSettings.viscosity === 'custom') {
           padPressure = pressureSettings.customPressure;
           padDwellTime = pressureSettings.customDwellTime;
@@ -221,7 +236,16 @@ export default function LinearMovePanel({
         g.push(...pressureGcode);
       }
       
-      g.push(`G1 X${fmt(mPad.x)} Y${fmt(mPad.y)} F${fmt(feedXY, 0)}`);
+      // Apply speed profile for this pad
+      if (speedProfileManager && speedSettings?.autoAdjust) {
+        const speedProfile = speedProfileManager.calculateOptimalSpeeds(padSize, pressureSettings?.viscosity);
+        padFeedXY = speedProfile.speeds.dispense * (speedSettings.globalMultiplier || 1.0);
+        
+        const speedGcode = speedProfileManager.generateSpeedGcode(speedProfile.speeds, `Speed profile for pad ${dPad.id || 'unknown'}`);
+        g.push(...speedGcode);
+      }
+      
+      g.push(`G1 X${fmt(mPad.x)} Y${fmt(mPad.y)} F${fmt(padFeedXY, 0)}`);
       if (isFinite(rotDeg) && rotDeg !== 0) g.push(`G0 ${axisLetter}${fmt(rotDeg, 2)}`);
       g.push(`G1 Z${fmt(zwork)} F${fmt(Vz * 60, 0)}`);
       g.push(valveOn);

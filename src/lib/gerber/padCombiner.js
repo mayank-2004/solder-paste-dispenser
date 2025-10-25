@@ -1,25 +1,25 @@
 import { extractPadsMm } from './extractPads.js';
 
 /**
- * Combines soldermask and solderpaste layers to get complete pad information
+ * Combines copper and solderpaste layers to get complete pad information
  * @param {Array} layers - Array of layer objects with type, side, and text properties
  * @param {string} side - 'top' or 'bottom'
- * @returns {Object} Combined pad data with positions from soldermask and dispensing info from solderpaste
+ * @returns {Object} Combined pad data with positions from copper and dispensing info from solderpaste
  */
 export function combinePadLayers(layers, side) {
-  const soldermaskLayer = layers.find(l => l.type === 'soldermask' && l.side === side);
+  const copperLayer = layers.find(l => l.type === 'copper' && l.side === side);
   const solderpasteLayer = layers.find(l => l.type === 'solderpaste' && l.side === side);
   
-  if (!soldermaskLayer && !solderpasteLayer) {
+  if (!copperLayer && !solderpasteLayer) {
     return { pads: [], hasGeometry: false, hasDispensing: false };
   }
 
-  let maskPads = [];
+  let copperPads = [];
   let pastePads = [];
   
-  // Extract pad positions from soldermask (more accurate geometry)
-  if (soldermaskLayer) {
-    maskPads = extractPadsMm(soldermaskLayer.text);
+  // Extract pad positions from copper layer (exact pad geometry)
+  if (copperLayer) {
+    copperPads = extractPadsMm(copperLayer.text);
   }
   
   // Extract dispensing targets from solderpaste
@@ -28,17 +28,20 @@ export function combinePadLayers(layers, side) {
   }
   
   // If we have both layers, match pads by proximity
-  if (maskPads.length > 0 && pastePads.length > 0) {
-    return matchPadsByProximity(maskPads, pastePads);
+  if (copperPads.length > 0 && pastePads.length > 0) {
+    return matchPadsByProximity(copperPads, pastePads);
   }
   
   // If only one layer available, use what we have
-  if (maskPads.length > 0) {
+  if (copperPads.length > 0) {
     return {
-      pads: maskPads.map((pad, idx) => ({
+      pads: copperPads.map((pad, idx) => ({
         ...pad,
-        id: `M${idx + 1}`,
-        source: 'soldermask',
+        width: pad.width || 1.0,
+        height: pad.height || 1.0,
+        shape: pad.shape || 'C',
+        id: `C${idx + 1}`,
+        source: 'copper',
         needsPaste: false // Unknown without solderpaste layer
       })),
       hasGeometry: true,
@@ -50,6 +53,9 @@ export function combinePadLayers(layers, side) {
     return {
       pads: pastePads.map((pad, idx) => ({
         ...pad,
+        width: pad.width || 1.0,
+        height: pad.height || 1.0,
+        shape: pad.shape || 'C',
         id: `P${idx + 1}`,
         source: 'solderpaste',
         needsPaste: true
@@ -63,25 +69,25 @@ export function combinePadLayers(layers, side) {
 }
 
 /**
- * Matches soldermask pads with solderpaste pads by proximity
- * @param {Array} maskPads - Pads from soldermask layer (accurate positions)
+ * Matches copper pads with solderpaste pads by proximity
+ * @param {Array} copperPads - Pads from copper layer (exact positions)
  * @param {Array} pastePads - Pads from solderpaste layer (dispensing targets)
  * @returns {Object} Combined pad data
  */
-function matchPadsByProximity(maskPads, pastePads) {
+function matchPadsByProximity(copperPads, pastePads) {
   const MATCH_THRESHOLD = 0.5; // mm - maximum distance to consider pads as matching
   const combinedPads = [];
   const usedPasteIndices = new Set();
   
-  // For each soldermask pad, find closest solderpaste pad
-  maskPads.forEach((maskPad, maskIdx) => {
+  // For each copper pad, find closest solderpaste pad
+  copperPads.forEach((copperPad, copperIdx) => {
     let closestPasteIdx = -1;
     let minDistance = Infinity;
     
     pastePads.forEach((pastePad, pasteIdx) => {
       if (usedPasteIndices.has(pasteIdx)) return;
       
-      const distance = Math.hypot(maskPad.x - pastePad.x, maskPad.y - pastePad.y);
+      const distance = Math.hypot(copperPad.x - pastePad.x, copperPad.y - pastePad.y);
       if (distance < minDistance && distance <= MATCH_THRESHOLD) {
         minDistance = distance;
         closestPasteIdx = pasteIdx;
@@ -89,11 +95,14 @@ function matchPadsByProximity(maskPads, pastePads) {
     });
     
     if (closestPasteIdx >= 0) {
-      // Matched pad - use soldermask position (more accurate) with solderpaste info
+      // Matched pad - use copper position (exact geometry) with solderpaste info
       usedPasteIndices.add(closestPasteIdx);
       combinedPads.push({
-        x: maskPad.x,
-        y: maskPad.y,
+        x: copperPad.x,
+        y: copperPad.y,
+        width: copperPad.width || 1.0,
+        height: copperPad.height || 1.0,
+        shape: copperPad.shape || 'C',
         id: `C${combinedPads.length + 1}`,
         source: 'combined',
         needsPaste: true,
@@ -101,12 +110,15 @@ function matchPadsByProximity(maskPads, pastePads) {
         matchDistance: minDistance
       });
     } else {
-      // Unmatched soldermask pad - no paste needed
+      // Unmatched copper pad - no paste needed
       combinedPads.push({
-        x: maskPad.x,
-        y: maskPad.y,
-        id: `M${maskIdx + 1}`,
-        source: 'soldermask',
+        x: copperPad.x,
+        y: copperPad.y,
+        width: copperPad.width || 1.0,
+        height: copperPad.height || 1.0,
+        shape: copperPad.shape || 'C',
+        id: `C${copperIdx + 1}`,
+        source: 'copper',
         needsPaste: false
       });
     }
@@ -118,6 +130,9 @@ function matchPadsByProximity(maskPads, pastePads) {
       combinedPads.push({
         x: pastePad.x,
         y: pastePad.y,
+        width: pastePad.width || 1.0,
+        height: pastePad.height || 1.0,
+        shape: pastePad.shape || 'C',
         id: `P${pasteIdx + 1}`,
         source: 'solderpaste',
         needsPaste: true,
@@ -132,7 +147,7 @@ function matchPadsByProximity(maskPads, pastePads) {
     hasGeometry: true,
     hasDispensing: true,
     matchedCount: usedPasteIndices.size,
-    totalMaskPads: maskPads.length,
+    totalCopperPads: copperPads.length,
     totalPastePads: pastePads.length
   };
 }
@@ -144,14 +159,14 @@ function matchPadsByProximity(maskPads, pastePads) {
  * @returns {Object} Available layer information
  */
 export function getAvailableLayerCombinations(layers, side) {
-  const soldermask = layers.find(l => l.type === 'soldermask' && l.side === side);
+  const copper = layers.find(l => l.type === 'copper' && l.side === side);
   const solderpaste = layers.find(l => l.type === 'solderpaste' && l.side === side);
   
   return {
-    hasSoldermask: !!soldermask,
+    hasCopper: !!copper,
     hasSolderpaste: !!solderpaste,
-    soldermaskFile: soldermask?.filename,
+    copperFile: copper?.filename,
     solderpasteFile: solderpaste?.filename,
-    canCombine: !!(soldermask && solderpaste)
+    canCombine: !!(copper && solderpaste)
   };
 }
