@@ -10,6 +10,7 @@ import ComponentList from "./components/ComponentList.jsx";
 import LinearMovePanel from "./components/LinearMovePanel.jsx";
 import FiducialPanel from "./components/FiducialPanel.jsx";
 import PressurePanel from "./components/PressurePanel.jsx";
+import SpeedPanel from "./components/SpeedPanel.jsx";
 import { identifyLayers } from "./lib/gerber/identifyLayers.js";
 import { stackupToSvg } from "./lib/gerber/stackupToSvg.js";
 import { extractPadsMm } from "./lib/gerber/extractPads.js";
@@ -27,19 +28,40 @@ import { NozzleMaintenanceManager } from "./lib/maintenance/nozzleMaintenance.js
 import { generatePath } from "./lib/motion/pathGeneration.js";
 import { combinePadLayers, getAvailableLayerCombinations } from "./lib/gerber/padCombiner.js";
 import { PressureController, VISCOSITY_TYPES } from "./lib/pressure/pressureControl.js";
+import { SpeedProfileManager } from "./lib/speed/speedProfiles.js";
+import { PasteVisualizer } from "./lib/paste/pasteVisualization.js";
 
 function padCenter(p) {
-  if (typeof p.cx === "number" && typeof p.cy === "number") return { x: p.cx, y: p.cy };
+  console.log('Processing pad for center:', p);
+  
+  // If already has center coordinates
+  if (typeof p.cx === "number" && typeof p.cy === "number") {
+    console.log('Using cx/cy:', { x: p.cx, y: p.cy });
+    return { x: p.cx, y: p.cy };
+  }
+  
+  // If has x/y coordinates
   if (typeof p.x === "number" && typeof p.y === "number") {
     const isTopLeft = p.origin === "topleft" || p.topLeft === true || p.anchor === "tl";
+    
+    // If top-left origin with dimensions, calculate center
     if (isTopLeft && (typeof p.width === "number" && typeof p.height === "number")) {
-      return { x: p.x + p.width / 2, y: p.y + p.height / 2 };
+      const center = { x: p.x + p.width / 2, y: p.y + p.height / 2 };
+      console.log('Calculated center from top-left + dimensions:', center);
+      return center;
     }
     if (isTopLeft && (typeof p.w === "number" && typeof p.h === "number")) {
-      return { x: p.x + p.w / 2, y: p.y + p.h / 2 };
+      const center = { x: p.x + p.w / 2, y: p.y + p.h / 2 };
+      console.log('Calculated center from top-left + w/h:', center);
+      return center;
     }
+    
+    // Assume x/y is already center
+    console.log('Using x/y as center:', { x: p.x, y: p.y });
     return { x: p.x, y: p.y };
   }
+  
+  console.log('No valid coordinates, using default:', { x: 0, y: 0 });
   return { x: 0, y: 0 };
 }
 
@@ -106,6 +128,9 @@ export default function App() {
   const [maintenanceManager] = useState(() => new NozzleMaintenanceManager());
   const [fiducialVisionDetector] = useState(() => new FiducialVisionDetector());
   const [pressureController] = useState(() => new PressureController());
+  const [speedProfileManager] = useState(() => new SpeedProfileManager());
+  const [pasteVisualizer] = useState(() => new PasteVisualizer());
+  const [showPasteDots, setShowPasteDots] = useState(false);
   // const [visionEnabled, setVisionEnabled] = useState(false);
   // const [qualityEnabled, setQualityEnabled] = useState(false);
   const [maintenanceAlert, setMaintenanceAlert] = useState(null);
@@ -199,6 +224,14 @@ export default function App() {
     }
   });
 
+  const [speedSettings, setSpeedSettings] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("speedSettings") || '{"autoAdjust": true, "globalMultiplier": 1.0}');
+    } catch (error) {
+      return { autoAdjust: true, globalMultiplier: 1.0 };
+    }
+  });
+
   useEffect(() => {
     localStorage.setItem("nozzleDia", JSON.stringify(nozzleDia));
   }, [nozzleDia]);
@@ -206,6 +239,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("pressureSettings", JSON.stringify(pressureSettings));
   }, [pressureSettings]);
+
+  useEffect(() => {
+    localStorage.setItem("speedSettings", JSON.stringify(speedSettings));
+  }, [speedSettings]);
 
   const transformSummary = useMemo(() => {
     if (!xf) return null;
@@ -344,19 +381,7 @@ export default function App() {
     const blob = await zipTextFiles(outputs);
     downloadBlob("layers_svg.zip", blob);
   }
-  async function exportAllGcodeZip(flavor = "marlin") {
-    const outputs = layers.map(l => {
-      const gc = convertGerberToGcode(l.text, { 
-        flavor,
-        transform: xf,
-        applyTransform: applyXf && xf
-      });
-      const base = l.filename.replace(/\.[^.]+$/, "");
-      return { name: `${base}.gcode`, text: gc };
-    });
-    const blob = await zipTextFiles(outputs);
-    downloadBlob("layers_gcode.zip", blob);
-  }
+
 
   const NS = "http://www.w3.org/2000/svg";
   const getSvgEl = useCallback(() => document.querySelector(".viewer .canvas svg"), []);
@@ -461,7 +486,7 @@ export default function App() {
       const uh = mmToCurrentUnits({ x: activeRef.x, y: activeRef.y });
       const isOrigin = activeRef === selectedOrigin;
       const color = isOrigin ? "#0a0" : "#ff6600";
-      const label = isOrigin ? "PCB ORIGIN" : `REF: ${activeRef.id || 'FIDUCIAL'}`;
+      const label = isOrigin ? "TOP-LEFT ORIGIN" : `REF: ${activeRef.id || 'FIDUCIAL'}`;
       drawCircle(gm, uh.x, uh.y, uh.r, isOrigin ? "rgba(0,180,0,0.25)" : "rgba(255,102,0,0.25)", color);
       drawText(gm, uh.x + uh.r * 1.6, uh.y - uh.r * 0.8, label, uh.r * 1.0, color);
     }
@@ -470,41 +495,86 @@ export default function App() {
       // Find the selected pad to draw border around it
       const selectedPad = pads.find(p => Math.abs(p.x - selectedMm.x) < 0.1 && Math.abs(p.y - selectedMm.y) < 0.1);
       if (selectedPad) {
-        const u = mmToCurrentUnits(selectedMm);
-        const padWidth = (selectedPad.width || 1) / geom.mmPerUnit;
-        const padHeight = (selectedPad.height || 1) / geom.mmPerUnit;
         
-        // Draw border rectangle centered on pad
-        const rect = document.createElementNS(NS, "rect");
-        rect.setAttribute("x", u.x - padWidth/2);
-        rect.setAttribute("y", u.y - padHeight/2);
-        rect.setAttribute("width", padWidth);
-        rect.setAttribute("height", padHeight);
-        rect.setAttribute("fill", "none");
-        rect.setAttribute("stroke", "#ff0000");
-        rect.setAttribute("stroke-width", u.r * 0.15);
-        rect.setAttribute("stroke-dasharray", "2,2");
-        gm.appendChild(rect);
+        // Use actual pad center coordinates from the pad object
+        const padCenter = { x: selectedPad.x, y: selectedPad.y };
+        const u = mmToCurrentUnits(padCenter);
         
-        // Draw center crosshair
-        const crossSize = Math.min(padWidth, padHeight) * 0.3;
+        // Calculate marker radius based on actual pad dimensions
+        const padWidth = selectedPad.width || 1.0;
+        const padHeight = selectedPad.height || 1.0;
+        const maxDimension = Math.max(padWidth, padHeight);
+        
+        // Marker radius should be slightly larger than the pad (110% of max dimension)
+        const markerRadius = (maxDimension * 1) / geom.mmPerUnit;
+        
+        // Draw border circle centered on actual pad center
+        const circle = document.createElementNS(NS, "circle");
+        circle.setAttribute("cx", u.x);
+        circle.setAttribute("cy", u.y);
+        circle.setAttribute("r", markerRadius);
+        circle.setAttribute("fill", "none");
+        circle.setAttribute("stroke", "#ff0000");
+        circle.setAttribute("stroke-width", markerRadius * 0.08);
+        circle.setAttribute("stroke-dasharray", "3,3");
+        gm.appendChild(circle);
+        
+        // Draw center crosshair at actual pad center
+        const crossSize = (maxDimension * 0.3) / geom.mmPerUnit;
         const hLine = document.createElementNS(NS, "line");
-        hLine.setAttribute("x1", u.x - crossSize/2);
+        hLine.setAttribute("x1", u.x - crossSize);
         hLine.setAttribute("y1", u.y);
-        hLine.setAttribute("x2", u.x + crossSize/2);
+        hLine.setAttribute("x2", u.x + crossSize);
         hLine.setAttribute("y2", u.y);
         hLine.setAttribute("stroke", "#ff0000");
-        hLine.setAttribute("stroke-width", u.r * 0.1);
+        hLine.setAttribute("stroke-width", markerRadius * 0.06);
         gm.appendChild(hLine);
         
         const vLine = document.createElementNS(NS, "line");
         vLine.setAttribute("x1", u.x);
-        vLine.setAttribute("y1", u.y - crossSize/2);
+        vLine.setAttribute("y1", u.y - crossSize);
         vLine.setAttribute("x2", u.x);
-        vLine.setAttribute("y2", u.y + crossSize/2);
+        vLine.setAttribute("y2", u.y + crossSize);
         vLine.setAttribute("stroke", "#ff0000");
-        vLine.setAttribute("stroke-width", u.r * 0.1);
+        vLine.setAttribute("stroke-width", markerRadius * 0.06);
         gm.appendChild(vLine);
+        
+        // Add center dot for precise center indication
+        const centerDot = document.createElementNS(NS, "circle");
+        centerDot.setAttribute("cx", u.x);
+        centerDot.setAttribute("cy", u.y);
+        centerDot.setAttribute("r", markerRadius * 0.15);
+        centerDot.setAttribute("fill", "#ff0000");
+        gm.appendChild(centerDot);
+        
+        // Draw paste visualization dots if enabled
+        if (showPasteDots) {
+          const pasteDots = pasteVisualizer.calculateDotPattern(selectedPad, nozzleDia);
+          pasteDots.forEach((dot, idx) => {
+            const dotU = mmToCurrentUnits({ x: dot.x, y: dot.y });
+            const dotRadius = (nozzleDia * 0.3) / geom.mmPerUnit; // Smaller dots
+            
+            const pasteCircle = document.createElementNS(NS, "circle");
+            pasteCircle.setAttribute("cx", dotU.x);
+            pasteCircle.setAttribute("cy", dotU.y);
+            pasteCircle.setAttribute("r", dotRadius);
+            pasteCircle.setAttribute("fill", "rgba(0, 200, 0, 0.7)");
+            pasteCircle.setAttribute("stroke", "#008800");
+            pasteCircle.setAttribute("stroke-width", dotRadius * 0.15);
+            gm.appendChild(pasteCircle);
+            
+            // Add dot number (smaller text)
+            const dotText = document.createElementNS(NS, "text");
+            dotText.setAttribute("x", dotU.x);
+            dotText.setAttribute("y", dotU.y + dotRadius * 0.2);
+            dotText.setAttribute("text-anchor", "middle");
+            dotText.setAttribute("font-size", dotRadius * 0.6);
+            dotText.setAttribute("fill", "#ffffff");
+            dotText.setAttribute("font-weight", "bold");
+            dotText.textContent = idx + 1;
+            gm.appendChild(dotText);
+          });
+        }
       }
     }
 
@@ -597,7 +667,7 @@ export default function App() {
       go.appendChild(cross2);
       
       drawCircle(go, uo.x, uo.y, uo.r * 0.8, "rgba(255,69,0,0.15)", "#ff4500");
-      drawText(go, uo.x + uo.r * 1.8, uo.y - uo.r * 0.8, "ORIGIN", uo.r * 1.0, "#ff4500");
+      drawText(go, uo.x + uo.r * 1.8, uo.y - uo.r * 0.8, "TOP-LEFT", uo.r * 1.0, "#ff4500");
       console.log('Origin marker drawn at:', uo.x, uo.y);
     } else {
       console.log('No selectedOrigin to draw');
@@ -674,7 +744,10 @@ export default function App() {
     const pt = svgEl.createSVGPoint(); pt.x = evt.clientX; pt.y = evt.clientY;
     const ctm = svgEl.getScreenCTM(); if (!ctm) return null;
     const local = pt.matrixTransform(ctm.inverse());
-    return { x: (local.x - geom.minX) * geom.mmPerUnit, y: (local.y - geom.minY) * geom.mmPerUnit };
+    const mmX = (local.x - geom.minX) * geom.mmPerUnit;
+    const mmY = (local.y - geom.minY) * geom.mmPerUnit;
+    console.log('Click conversion:', { clientX: evt.clientX, clientY: evt.clientY, localX: local.x, localY: local.y, mmX, mmY });
+    return { x: mmX, y: mmY };
   };
 
   function isClickInsidePad(clickMm) {
@@ -913,7 +986,7 @@ export default function App() {
       const dx = padCenter.x - refPoint.x;
       const dy = padCenter.y - refPoint.y;
       const dist = Math.hypot(dx, dy);
-      const refName = refPoint === selectedOrigin ? 'PCB Origin' : `Fiducial ${refPoint.id || ''}`;
+      const refName = refPoint === selectedOrigin ? 'Top-Left Origin' : `Fiducial ${refPoint.id || ''}`;
       const show = window.confirm(
         `Distance from ${refName}:\n` +
         `ΔX: ${dx.toFixed(2)} mm\n` +
@@ -1108,16 +1181,7 @@ export default function App() {
           <LayerList layers={layers} onToggle={toggleLayer} />
         </div>
 
-        <div className="section Gcode-section">
-          <h3 style={{ color: '#007bff', padding: '8px 12px', borderBottom: '2px solid #007bff' }}>G-code</h3>
-          <div className="flex-row">
-            <button className="btn" onClick={() => exportAllGcodeZip("marlin")} disabled={layers.length === 0}>Export G-code (Marlin ZIP)</button>
-            <button className="btn secondary" onClick={() => exportAllGcodeZip("grbl")} disabled={layers.length === 0}>Export G-code (GRBL ZIP)</button>
-            <button className="btn" onClick={() => exportAllGcodeZip("creality")} disabled={layers.length === 0}>
-              Export G-code (Creality FDM ZIP)
-            </button>
-          </div>
-        </div>
+
 
         <div className="section Components-section">
           <h3 style={{ color: '#007bff', padding: '8px 12px', borderBottom: '2px solid #007bff' }}>Components</h3>
@@ -1133,12 +1197,12 @@ export default function App() {
               } else setPads([]);
               setSelectedMm(null);
             }}>
-              <option value="">(select layer combination)</option>
+              <option value="">(select paste + copper layers)</option>
               {layers.map((l, i) => {
                 if (l.type === "solderpaste") {
                   const combo = getAvailableLayerCombinations(layers, l.side);
                   const label = combo.canCombine ? 
-                    `${l.filename} + soldermask (combined)` : 
+                    `${l.filename} + copper (combined)` : 
                     `${l.filename} (paste only)`;
                   return <option key={l.filename} value={i}>{label}</option>;
                 }
@@ -1185,13 +1249,13 @@ export default function App() {
                 🎯 Detect Origins
               </button>
               <button className="btn sm secondary" onClick={() => {
-                // Test origin at fixed position
-                const testOrigin = { id: 'O1', x: 0, y: 0, confidence: 0.9, description: 'Test origin' };
+                // Test origin at top-left corner
+                const testOrigin = { id: 'O1', x: 0, y: 0, confidence: 0.9, description: 'Top-left corner (test)' };
                 setSelectedOrigin(testOrigin);
-                console.log('Set test origin:', testOrigin);
+                console.log('Set test origin (top-left):', testOrigin);
                 setTimeout(() => updateOverlay(), 100);
               }}>
-                Test Origin
+                Test Origin (Top-Left)
               </button>
               <button className="btn sm secondary" onClick={() => {
                 setSelectedOrigin(null);
@@ -1200,7 +1264,7 @@ export default function App() {
                 Clear
               </button>
             </div>
-            <small>Machine coordinates where PCB design origin (0,0) is located</small>
+            <small>Machine coordinates where PCB top-left corner (0,0) is located</small>
           </div>
           
           <div className="section Reference-section" style={{ marginTop: 16 }}>
@@ -1212,7 +1276,7 @@ export default function App() {
                     setReferenceType('origin');
                     setReferencePoint(null);
                   }} />
-                PCB Origin
+                Top-Left Origin
               </label>
               <label>
                 <input type="radio" name="refType" checked={referenceType === 'fiducial'} 
@@ -1255,7 +1319,7 @@ export default function App() {
 
         {(referencePoint || selectedOrigin) && selectedMm && (
           <div className="distance-info">
-            <span className="badge">Path from {referencePoint ? `Fiducial ${referencePoint.id}` : 'PCB Origin'}</span>
+            <span className="badge">Path from {referencePoint ? `Fiducial ${referencePoint.id}` : 'Top-Left Origin'}</span>
             <div className="kvs">
               <span>ΔX: {(selectedMm.x - (referencePoint || selectedOrigin).x).toFixed(2)} mm</span>
               <span>ΔY: {(selectedMm.y - (referencePoint || selectedOrigin).y).toFixed(2)} mm</span>
@@ -1268,6 +1332,10 @@ export default function App() {
                 <option value="safe">Safe Path (Lift)</option>
                 <option value="optimized">Optimized Path</option>
               </select>
+              <label style={{ marginLeft: 8, fontSize: 12 }}>
+                <input type="checkbox" checked={showPasteDots} onChange={(e) => setShowPasteDots(e.target.checked)} />
+                Show Paste Dots
+              </label>
               {generatedPath && (
                 <small style={{ marginLeft: 8, color: '#666' }}>
                   {generatedPath.type} • {generatedPath.segments.length} segments
@@ -1350,6 +1418,14 @@ export default function App() {
             setPressureSettings={setPressureSettings}
             selectedPad={selectedMm ? pads.find(p => Math.abs(p.x - selectedMm.x) < 0.1 && Math.abs(p.y - selectedMm.y) < 0.1) : null}
           />
+          <SpeedPanel
+            speedProfileManager={speedProfileManager}
+            speedSettings={speedSettings}
+            setSpeedSettings={setSpeedSettings}
+            selectedPad={selectedMm ? pads.find(p => Math.abs(p.x - selectedMm.x) < 0.1 && Math.abs(p.y - selectedMm.y) < 0.1) : null}
+            pressureSettings={pressureSettings}
+            pads={pads}
+          />
           <LinearMovePanel
             homeDesign={selectedOrigin ? { x: selectedOrigin.x, y: selectedOrigin.y } : null}
             focusDesign={selectedMm}
@@ -1361,6 +1437,8 @@ export default function App() {
             maintenanceManager={maintenanceManager}
             pressureController={pressureController}
             pressureSettings={pressureSettings}
+            speedProfileManager={speedProfileManager}
+            speedSettings={speedSettings}
           />
           <SerialPanel />
         </div>
