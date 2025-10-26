@@ -11,6 +11,7 @@ import LinearMovePanel from "./components/LinearMovePanel.jsx";
 import FiducialPanel from "./components/FiducialPanel.jsx";
 import PressurePanel from "./components/PressurePanel.jsx";
 import SpeedPanel from "./components/SpeedPanel.jsx";
+import AutomatedDispensingPanel from "./components/AutomatedDispensingPanel.jsx";
 import { identifyLayers } from "./lib/gerber/identifyLayers.js";
 import { stackupToSvg } from "./lib/gerber/stackupToSvg.js";
 import { extractPadsMm } from "./lib/gerber/extractPads.js";
@@ -30,6 +31,9 @@ import { combinePadLayers, getAvailableLayerCombinations } from "./lib/gerber/pa
 import { PressureController, VISCOSITY_TYPES } from "./lib/pressure/pressureControl.js";
 import { SpeedProfileManager } from "./lib/speed/speedProfiles.js";
 import { PasteVisualizer } from "./lib/paste/pasteVisualization.js";
+import { extractBoardOutline } from "./lib/gerber/boardOutline.js";
+import { DispensingSequencer } from "./lib/automation/dispensingSequence.js";
+import { SafePathPlanner } from "./lib/automation/safePathPlanner.js";
 
 function padCenter(p) {
   console.log('Processing pad for center:', p);
@@ -130,7 +134,15 @@ export default function App() {
   const [pressureController] = useState(() => new PressureController());
   const [speedProfileManager] = useState(() => new SpeedProfileManager());
   const [pasteVisualizer] = useState(() => new PasteVisualizer());
+  const [dispensingSequencer] = useState(() => new DispensingSequencer());
+  const [safePathPlanner] = useState(() => new SafePathPlanner());
   const [showPasteDots, setShowPasteDots] = useState(false);
+  const [boardOutline, setBoardOutline] = useState(null);
+  const [dispensingSequence, setDispensingSequence] = useState([]);
+  const [safeSequence, setSafeSequence] = useState([]);
+  const [jobStatistics, setJobStatistics] = useState(null);
+  const [useSafePathPlanning, setUseSafePathPlanning] = useState(true);
+  const [componentHeights, setComponentHeights] = useState([]);
   // const [visionEnabled, setVisionEnabled] = useState(false);
   // const [qualityEnabled, setQualityEnabled] = useState(false);
   const [maintenanceAlert, setMaintenanceAlert] = useState(null);
@@ -297,6 +309,14 @@ export default function App() {
     // Detect fiducials automatically
     const detectedFiducials = analyzeFiducialsInLayers(ls);
     setFiducialDetectionResult(detectedFiducials);
+
+    // Detect board outline if available
+    const outlineLayer = ls.find(l => l.filename.toLowerCase().includes('outline') || l.filename.toLowerCase().includes('edge'));
+    if (outlineLayer) {
+      const outline = extractBoardOutline(outlineLayer.text);
+      setBoardOutline(outline);
+      console.log('Board outline detected:', outline);
+    }
 
     // Detect origin candidates
     const origins = detectPcbOrigins(ls);
@@ -737,6 +757,41 @@ export default function App() {
       setGeneratedPath(null);
     }
   }, [referencePoint, selectedOrigin, selectedMm, pads, pathType]);
+
+  // Generate dispensing sequence when reference point or pads change
+  useEffect(() => {
+    const refPoint = referencePoint || selectedOrigin;
+    if (refPoint && pads.length > 0) {
+      if (useSafePathPlanning) {
+        // Use safe path planning with collision avoidance
+        const safeSeq = safePathPlanner.calculateSafeSequence(refPoint, pads, boardOutline, componentHeights);
+        setSafeSequence(safeSeq);
+        setDispensingSequence(safeSeq);
+        
+        const stats = {
+          totalPads: safeSeq.length,
+          totalDistance: safeSeq.reduce((sum, pad) => sum + (pad.pathDistance || 0), 0).toFixed(2),
+          estimatedTime: Math.ceil(safeSeq.length * 3 + safeSeq.reduce((sum, pad) => sum + (pad.pathDistance || 0), 0) / 50),
+          averageDistance: (safeSeq.reduce((sum, pad) => sum + (pad.pathDistance || 0), 0) / safeSeq.length).toFixed(2),
+          safePathsUsed: safeSeq.filter(p => !p.requiresHighClearance).length,
+          highClearancePaths: safeSeq.filter(p => p.requiresHighClearance).length
+        };
+        setJobStatistics(stats);
+      } else {
+        // Use simple nearest neighbor
+        const sequence = dispensingSequencer.calculateOptimalSequence(refPoint, pads);
+        setDispensingSequence(sequence);
+        setSafeSequence([]);
+        
+        const stats = dispensingSequencer.calculateJobStatistics(refPoint, sequence);
+        setJobStatistics(stats);
+      }
+    } else {
+      setDispensingSequence([]);
+      setSafeSequence([]);
+      setJobStatistics(null);
+    }
+  }, [referencePoint, selectedOrigin, pads, dispensingSequencer, safePathPlanner, useSafePathPlanning, boardOutline, componentHeights]);
 
   const getEventMm = (evt) => {
     const svgEl = getSvgEl(); if (!svgEl) return null;
@@ -1399,6 +1454,26 @@ export default function App() {
         )}
 
         <div className="panels">
+          <AutomatedDispensingPanel
+            dispensingSequencer={dispensingSequencer}
+            dispensingSequence={dispensingSequence}
+            safeSequence={safeSequence}
+            jobStatistics={jobStatistics}
+            referencePoint={referencePoint}
+            selectedOrigin={selectedOrigin}
+            pressureSettings={pressureSettings}
+            speedSettings={speedSettings}
+            boardOutline={boardOutline}
+            useSafePathPlanning={useSafePathPlanning}
+            setUseSafePathPlanning={setUseSafePathPlanning}
+            componentHeights={componentHeights}
+            setComponentHeights={setComponentHeights}
+            safePathPlanner={safePathPlanner}
+            onStartJob={(gcode, sequence) => {
+              console.log('Starting automated dispensing job:', { gcode, sequence });
+              // This will be handled by SerialPanel for sending to machine
+            }}
+          />
           <CameraPanel
             fiducials={fiducials}
             xf={xf}
@@ -1439,6 +1514,13 @@ export default function App() {
             pressureSettings={pressureSettings}
             speedProfileManager={speedProfileManager}
             speedSettings={speedSettings}
+            dispensingSequencer={dispensingSequencer}
+            dispensingSequence={dispensingSequence}
+            safeSequence={safeSequence}
+            jobStatistics={jobStatistics}
+            boardOutline={boardOutline}
+            safePathPlanner={safePathPlanner}
+            useSafePathPlanning={useSafePathPlanning}
           />
           <SerialPanel />
         </div>
