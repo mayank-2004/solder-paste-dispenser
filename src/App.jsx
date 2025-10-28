@@ -12,6 +12,7 @@ import FiducialPanel from "./components/FiducialPanel.jsx";
 import PressurePanel from "./components/PressurePanel.jsx";
 import SpeedPanel from "./components/SpeedPanel.jsx";
 import AutomatedDispensingPanel from "./components/AutomatedDispensingPanel.jsx";
+import LivePreview from "./components/LivePreview.jsx";
 import { identifyLayers } from "./lib/gerber/identifyLayers.js";
 import { stackupToSvg } from "./lib/gerber/stackupToSvg.js";
 import { extractPadsMm } from "./lib/gerber/extractPads.js";
@@ -34,6 +35,7 @@ import { PasteVisualizer } from "./lib/paste/pasteVisualization.js";
 import { extractBoardOutline } from "./lib/gerber/boardOutline.js";
 import { DispensingSequencer } from "./lib/automation/dispensingSequence.js";
 import { SafePathPlanner } from "./lib/automation/safePathPlanner.js";
+
 
 function padCenter(p) {
   console.log('Processing pad for center:', p);
@@ -143,6 +145,40 @@ export default function App() {
   const [jobStatistics, setJobStatistics] = useState(null);
   const [useSafePathPlanning, setUseSafePathPlanning] = useState(true);
   const [componentHeights, setComponentHeights] = useState([]);
+  const [livePreview, setLivePreview] = useState({
+    isActive: false,
+    currentPadIndex: -1,
+    machinePosition: null,
+    completedPads: []
+  });
+
+  // Live preview control functions
+  const startLivePreview = () => {
+    setLivePreview({
+      isActive: true,
+      currentPadIndex: 0,
+      machinePosition: { x: 0, y: 0, z: 6 },
+      completedPads: []
+    });
+  };
+
+  const updateLivePreview = (padIndex, machinePos = null) => {
+    setLivePreview(prev => ({
+      ...prev,
+      currentPadIndex: padIndex,
+      machinePosition: machinePos || prev.machinePosition,
+      completedPads: dispensingSequence.slice(0, padIndex)
+    }));
+  };
+
+  const stopLivePreview = () => {
+    setLivePreview({
+      isActive: false,
+      currentPadIndex: -1,
+      machinePosition: null,
+      completedPads: []
+    });
+  };
   // const [visionEnabled, setVisionEnabled] = useState(false);
   // const [qualityEnabled, setQualityEnabled] = useState(false);
   const [maintenanceAlert, setMaintenanceAlert] = useState(null);
@@ -500,6 +536,107 @@ export default function App() {
       };
     };
 
+    // Draw live preview overlays
+    if (livePreview.isActive) {
+      const glive = ensureGroup("overlay-live");
+      
+      // Draw completed pads (green)
+      livePreview.completedPads.forEach(pad => {
+        const u = mmToCurrentUnits({ x: pad.x, y: pad.y });
+        const completedCircle = document.createElementNS(NS, "circle");
+        completedCircle.setAttribute("cx", u.x);
+        completedCircle.setAttribute("cy", u.y);
+        completedCircle.setAttribute("r", u.r * 0.8);
+        completedCircle.setAttribute("fill", "rgba(40, 167, 69, 0.7)");
+        completedCircle.setAttribute("stroke", "#28a745");
+        completedCircle.setAttribute("stroke-width", u.r * 0.1);
+        glive.appendChild(completedCircle);
+        
+        // Add checkmark
+        const checkmark = document.createElementNS(NS, "text");
+        checkmark.setAttribute("x", u.x);
+        checkmark.setAttribute("y", u.y + u.r * 0.3);
+        checkmark.setAttribute("text-anchor", "middle");
+        checkmark.setAttribute("font-size", u.r * 0.8);
+        checkmark.setAttribute("fill", "white");
+        checkmark.setAttribute("font-weight", "bold");
+        checkmark.textContent = "✓";
+        glive.appendChild(checkmark);
+      });
+      
+      // Draw current pad (pulsing orange)
+      if (livePreview.currentPadIndex >= 0 && dispensingSequence[livePreview.currentPadIndex]) {
+        const currentPad = dispensingSequence[livePreview.currentPadIndex];
+        const u = mmToCurrentUnits({ x: currentPad.x, y: currentPad.y });
+        
+        const currentCircle = document.createElementNS(NS, "circle");
+        currentCircle.setAttribute("cx", u.x);
+        currentCircle.setAttribute("cy", u.y);
+        currentCircle.setAttribute("r", u.r * 1.2);
+        currentCircle.setAttribute("fill", "rgba(255, 193, 7, 0.8)");
+        currentCircle.setAttribute("stroke", "#ffc107");
+        currentCircle.setAttribute("stroke-width", u.r * 0.15);
+        
+        // Add pulsing animation
+        const animate = document.createElementNS(NS, "animate");
+        animate.setAttribute("attributeName", "r");
+        animate.setAttribute("values", `${u.r * 1.0};${u.r * 1.4};${u.r * 1.0}`);
+        animate.setAttribute("dur", "1.5s");
+        animate.setAttribute("repeatCount", "indefinite");
+        currentCircle.appendChild(animate);
+        
+        glive.appendChild(currentCircle);
+        
+        // Add "DISPENSING" label
+        const label = document.createElementNS(NS, "text");
+        label.setAttribute("x", u.x);
+        label.setAttribute("y", u.y - u.r * 1.8);
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("font-size", u.r * 0.6);
+        label.setAttribute("fill", "#dc3545");
+        label.setAttribute("font-weight", "bold");
+        label.textContent = "DISPENSING";
+        glive.appendChild(label);
+      }
+      
+      // Draw machine position (blue crosshair)
+      if (livePreview.machinePosition) {
+        const u = mmToCurrentUnits(livePreview.machinePosition);
+        const crossSize = u.r * 0.8;
+        
+        // Horizontal line
+        const hLine = document.createElementNS(NS, "line");
+        hLine.setAttribute("x1", u.x - crossSize);
+        hLine.setAttribute("y1", u.y);
+        hLine.setAttribute("x2", u.x + crossSize);
+        hLine.setAttribute("y2", u.y);
+        hLine.setAttribute("stroke", "#007bff");
+        hLine.setAttribute("stroke-width", u.r * 0.1);
+        glive.appendChild(hLine);
+        
+        // Vertical line
+        const vLine = document.createElementNS(NS, "line");
+        vLine.setAttribute("x1", u.x);
+        vLine.setAttribute("y1", u.y - crossSize);
+        vLine.setAttribute("x2", u.x);
+        vLine.setAttribute("y2", u.y + crossSize);
+        vLine.setAttribute("stroke", "#007bff");
+        vLine.setAttribute("stroke-width", u.r * 0.1);
+        glive.appendChild(vLine);
+        
+        // Center dot
+        const centerDot = document.createElementNS(NS, "circle");
+        centerDot.setAttribute("cx", u.x);
+        centerDot.setAttribute("cy", u.y);
+        centerDot.setAttribute("r", u.r * 0.2);
+        centerDot.setAttribute("fill", "#007bff");
+        glive.appendChild(centerDot);
+      }
+    } else {
+      // Clear live preview overlays when not active
+      ensureGroup("overlay-live");
+    }
+
     // Draw reference point (origin or fiducial)
     const activeRef = referencePoint || selectedOrigin;
     if (activeRef) {
@@ -712,7 +849,7 @@ export default function App() {
     } else {
       ensureGroup("overlay-ghost");
     }
-  }, [selectedMm, fiducials, xf, selectedOrigin, generatedPath, pads, getSvgEl, getSvgGeom]);
+  }, [selectedMm, fiducials, xf, selectedOrigin, generatedPath, pads, getSvgEl, getSvgGeom, livePreview, dispensingSequence]);
 
   const hexToRgba = (hex, a = 0.3) => {
     const h = hex.replace("#", "");
@@ -1245,21 +1382,23 @@ export default function App() {
               const idx = e.target.value === "" ? null : +e.target.value;
               setPasteIdx(idx);
               if (idx != null) {
-                const selectedSide = layers[idx].side || side;
-                const combinedData = combinePadLayers(layers, selectedSide);
-                setPads(processPads(combinedData.pads.map(padCenter)));
-                console.log('Combined pad data:', combinedData);
+                const selectedLayer = layers[idx];
+                
+                if (selectedLayer.type === "solderpaste") {
+                  // Use solderpaste layer - contains only actual pad areas for dispensing
+                  const padData = extractPadsMm(selectedLayer.text).map(padCenter);
+                  setPads(processPads(padData));
+                  console.log('Solderpaste layer loaded:', padData.length, 'pads');
+                } else {
+                  setPads([]);
+                }
               } else setPads([]);
               setSelectedMm(null);
             }}>
-              <option value="">(select paste + copper layers)</option>
+              <option value="">(select solderpaste layer)</option>
               {layers.map((l, i) => {
                 if (l.type === "solderpaste") {
-                  const combo = getAvailableLayerCombinations(layers, l.side);
-                  const label = combo.canCombine ? 
-                    `${l.filename} + copper (combined)` : 
-                    `${l.filename} (paste only)`;
-                  return <option key={l.filename} value={i}>{label}</option>;
+                  return <option key={l.filename} value={i}>{l.filename} (solderpaste)</option>;
                 }
                 return null;
               })}
@@ -1271,14 +1410,6 @@ export default function App() {
               setSelectedMm({ x: pad.x, y: pad.y });
             }}
           />
-
-          {/* <div className="section">
-            <h3>Advanced Features</h3>
-            <div className="flex-row wrap" style={{ gap: 8 }}>
-              <label><input type="checkbox" checked={visionEnabled} onChange={(e) => setVisionEnabled(e.target.checked)} /> Vision Guidance</label>
-              <label><input type="checkbox" checked={qualityEnabled} onChange={(e) => setQualityEnabled(e.target.checked)} /> Quality Control</label>
-            </div>
-          </div> */}
 
           <div className="section Origin-section">
             <h3 style={{ color: '#007bff', padding: '8px 12px', borderBottom: '2px solid #007bff' }}>PCB Origin</h3>
@@ -1454,6 +1585,13 @@ export default function App() {
         )}
 
         <div className="panels">
+          <LivePreview
+            dispensingSequence={dispensingSequence}
+            isJobRunning={livePreview.isActive}
+            currentPadIndex={livePreview.currentPadIndex}
+            machinePosition={livePreview.machinePosition}
+            onUpdateOverlay={updateOverlay}
+          />
           <AutomatedDispensingPanel
             dispensingSequencer={dispensingSequencer}
             dispensingSequence={dispensingSequence}
@@ -1471,7 +1609,6 @@ export default function App() {
             safePathPlanner={safePathPlanner}
             onStartJob={(gcode, sequence) => {
               console.log('Starting automated dispensing job:', { gcode, sequence });
-              // This will be handled by SerialPanel for sending to machine
             }}
           />
           <CameraPanel
@@ -1501,7 +1638,8 @@ export default function App() {
             pressureSettings={pressureSettings}
             pads={pads}
           />
-          <LinearMovePanel
+
+          {/* <LinearMovePanel
             homeDesign={selectedOrigin ? { x: selectedOrigin.x, y: selectedOrigin.y } : null}
             focusDesign={selectedMm}
             xf={xf}
@@ -1521,8 +1659,21 @@ export default function App() {
             boardOutline={boardOutline}
             safePathPlanner={safePathPlanner}
             useSafePathPlanning={useSafePathPlanning}
+          /> */}
+          <SerialPanel 
+            dispensingSequence={dispensingSequence}
+            jobStatistics={jobStatistics}
+            pressureSettings={pressureSettings}
+            speedSettings={speedSettings}
+            onJobStart={(gcode) => {
+              console.log('Dispensing job started via SerialPanel');
+              maintenanceManager.recordDispense();
+            }}
+            onJobComplete={() => {
+              console.log('Dispensing job completed');
+              alert('Dispensing job completed successfully!');
+            }}
           />
-          <SerialPanel />
         </div>
       </main>
     </div>

@@ -313,7 +313,6 @@ export default function LinearMovePanel({
     <div className="panel linear-panel">
       <h3>Pick → Place Planner (XY + Zsafe/Zwork)</h3>
       
-      {/* Points A and B */}
       <div className="params-row">
         <fieldset className="box">
           <legend>Point A (mm)</legend>
