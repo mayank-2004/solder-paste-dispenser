@@ -28,6 +28,7 @@ import { QualityController } from "./lib/quality/qualityControl.js";
 import { UndoRedoManager } from "./lib/history/undoRedo.js";
 import { NozzleMaintenanceManager } from "./lib/maintenance/nozzleMaintenance.js";
 import { generatePath } from "./lib/motion/pathGeneration.js";
+import { pathToGcode, pathToDispensingGcode } from "./lib/motion/pathToGcode.js";
 import { combinePadLayers, getAvailableLayerCombinations } from "./lib/gerber/padCombiner.js";
 import { PressureController, VISCOSITY_TYPES } from "./lib/pressure/pressureControl.js";
 import { SpeedProfileManager } from "./lib/speed/speedProfiles.js";
@@ -35,50 +36,80 @@ import { PasteVisualizer } from "./lib/paste/pasteVisualization.js";
 import { extractBoardOutline } from "./lib/gerber/boardOutline.js";
 import { DispensingSequencer } from "./lib/automation/dispensingSequence.js";
 import { SafePathPlanner } from "./lib/automation/safePathPlanner.js";
+import { BatchProcessor } from "./lib/batch/batchProcessor.js";
+import { BatchExecutor } from "./lib/batch/batchExecutor.js";
+import { LayerDataExtractor } from "./lib/gerber/layerDataExtractor.js";
+import { debugCoordinateConversion } from "./lib/debug/coordinateDebug.js";
+import BatchPanel from "./components/BatchPanel.jsx";
 
 
-function padCenter(p) {
+function calculatePadCenter(p) {
   console.log('Processing pad for center:', p);
   
-  // If already has center coordinates
+  // Validate input
+  if (!p || typeof p !== 'object') {
+    console.warn('Invalid pad object:', p);
+    return { x: 0, y: 0, valid: false, method: 'fallback' };
+  }
+  
+  // Method 1: Explicit center coordinates
   if (typeof p.cx === "number" && typeof p.cy === "number") {
-    console.log('Using cx/cy:', { x: p.cx, y: p.cy });
-    return { x: p.cx, y: p.cy };
+    console.log('Using explicit cx/cy:', { x: p.cx, y: p.cy });
+    return { x: p.cx, y: p.cy, valid: true, method: 'explicit_center' };
   }
   
-  // If has x/y coordinates
-  if (typeof p.x === "number" && typeof p.y === "number") {
+  // Method 2: Center with width/height for validation
+  if (typeof p.x === "number" && typeof p.y === "number" && 
+      typeof p.width === "number" && typeof p.height === "number") {
+    
     const isTopLeft = p.origin === "topleft" || p.topLeft === true || p.anchor === "tl";
+    const isBottomLeft = p.origin === "bottomleft" || p.anchor === "bl";
+    const isCenter = !isTopLeft && !isBottomLeft;
     
-    // If top-left origin with dimensions, calculate center
-    if (isTopLeft && (typeof p.width === "number" && typeof p.height === "number")) {
-      const center = { x: p.x + p.width / 2, y: p.y + p.height / 2 };
-      console.log('Calculated center from top-left + dimensions:', center);
-      return center;
-    }
-    if (isTopLeft && (typeof p.w === "number" && typeof p.h === "number")) {
-      const center = { x: p.x + p.w / 2, y: p.y + p.h / 2 };
-      console.log('Calculated center from top-left + w/h:', center);
-      return center;
+    let center;
+    if (isTopLeft) {
+      center = { x: p.x + p.width / 2, y: p.y + p.height / 2 };
+    } else if (isBottomLeft) {
+      center = { x: p.x + p.width / 2, y: p.y - p.height / 2 };
+    } else {
+      // Assume center coordinates
+      center = { x: p.x, y: p.y };
     }
     
-    // Assume x/y is already center
-    console.log('Using x/y as center:', { x: p.x, y: p.y });
-    return { x: p.x, y: p.y };
+    console.log('Calculated center with validation:', center, 'method:', isTopLeft ? 'topleft' : isBottomLeft ? 'bottomleft' : 'center');
+    return { ...center, valid: true, method: isTopLeft ? 'topleft_calc' : isBottomLeft ? 'bottomleft_calc' : 'center_assumed', width: p.width, height: p.height };
   }
   
-  console.log('No valid coordinates, using default:', { x: 0, y: 0 });
-  return { x: 0, y: 0 };
+  // Method 3: Basic x/y coordinates (assume center)
+  if (typeof p.x === "number" && typeof p.y === "number") {
+    console.log('Using x/y as center (no dimensions):', { x: p.x, y: p.y });
+    return { x: p.x, y: p.y, valid: true, method: 'xy_assumed', width: p.width || 1, height: p.height || 1 };
+  }
+  
+  console.warn('No valid coordinates found, using fallback:', { x: 0, y: 0 });
+  return { x: 0, y: 0, valid: false, method: 'fallback' };
+}
+
+// Legacy wrapper for compatibility
+function padCenter(p) {
+  const result = calculatePadCenter(p);
+  return { x: result.x, y: result.y };
 }
 
 function processPads(points) {
-  return points.map((pad, idx) => ({
-    x: pad.x,
-    y: pad.y,
-    id: `P${idx + 1}`,
-    width: pad.width || 1,
-    height: pad.height || 1
-  }));
+  return points.map((pad, idx) => {
+    const centerInfo = calculatePadCenter(pad);
+    return {
+      x: centerInfo.x,
+      y: centerInfo.y,
+      id: `P${idx + 1}`,
+      width: centerInfo.width || pad.width || 1,
+      height: centerInfo.height || pad.height || 1,
+      centerValid: centerInfo.valid,
+      centerMethod: centerInfo.method,
+      originalPad: pad
+    };
+  });
 }
 
 function parseLengthToMm(lenStr = "") {
@@ -138,6 +169,11 @@ export default function App() {
   const [pasteVisualizer] = useState(() => new PasteVisualizer());
   const [dispensingSequencer] = useState(() => new DispensingSequencer());
   const [safePathPlanner] = useState(() => new SafePathPlanner());
+  const [batchProcessor] = useState(() => new BatchProcessor());
+  const [batchExecutor] = useState(() => new BatchExecutor(null, dispensingSequencer, pressureController, speedProfileManager));
+  const [currentBatchId, setCurrentBatchId] = useState(null);
+  const [currentBatch, setCurrentBatch] = useState(null);
+  const [layerData, setLayerData] = useState({});
   const [showPasteDots, setShowPasteDots] = useState(false);
   const [boardOutline, setBoardOutline] = useState(null);
   const [dispensingSequence, setDispensingSequence] = useState([]);
@@ -151,6 +187,88 @@ export default function App() {
     machinePosition: null,
     completedPads: []
   });
+
+  // Update current batch when selection changes
+  useEffect(() => {
+    if (currentBatchId && batchProcessor) {
+      setCurrentBatch(batchProcessor.getBatch(currentBatchId));
+    } else {
+      setCurrentBatch(null);
+    }
+  }, [currentBatchId, batchProcessor]);
+
+  // Batch processing handlers
+  const handleBatchSelect = (batchId) => {
+    setCurrentBatchId(batchId);
+  };
+
+  const handleStartBatch = async (batchId) => {
+    const batch = batchProcessor.getBatch(batchId);
+    if (!batch) return;
+    
+    if (batch.status === 'paused') {
+      // Resume paused batch
+      return handleResumeBatch(batchId);
+    }
+    
+    // Start new batch
+    const success = await batchProcessor.startBatch(batchId);
+    if (success) {
+      console.log('Batch started:', batchId);
+      try {
+        await batchExecutor.executeBatch(batch, batchProcessor);
+        console.log('Batch execution completed');
+      } catch (error) {
+        console.error('Batch execution failed:', error);
+        alert('Batch execution failed: ' + error.message);
+      }
+    }
+  };
+
+  const handlePauseBatch = (batchId) => {
+    batchProcessor.pauseBatch(batchId);
+  };
+
+  const handleResumeBatch = async (batchId) => {
+    const success = batchProcessor.resumeBatch(batchId);
+    if (success) {
+      try {
+        const batch = batchProcessor.getBatch(batchId);
+        await batchExecutor.executeBatch(batch, batchProcessor);
+        console.log('Batch execution resumed and completed');
+      } catch (error) {
+        console.error('Batch resume failed:', error);
+        alert('Batch resume failed: ' + error.message);
+      }
+    }
+  };
+
+  const handleAddCurrentBoard = (batchId) => {
+    if (!pads.length) {
+      alert('No pads loaded. Please load a PCB file first.');
+      return;
+    }
+    
+    const board = {
+      name: `Board ${Date.now()}`,
+      pads: pads,
+      fiducials: fiducials,
+      settings: {
+        pressure: pressureSettings,
+        speed: speedSettings
+      },
+      position: { x: 0, y: 0, rotation: 0 }
+    };
+    
+    batchProcessor.addBoard(batchId, board);
+    alert('Board added to batch!');
+  };
+
+  const handleDeleteBatch = (batchId) => {
+    if (currentBatchId === batchId) {
+      setCurrentBatchId(null);
+    }
+  };
 
   // Live preview control functions
   const startLivePreview = () => {
@@ -334,6 +452,11 @@ export default function App() {
     const read = await Promise.all(expanded.map(async f => ({ name: f.name, text: await f.text() })));
     const ls = identifyLayers(read);
     setLayers(ls);
+    
+    // Extract useful data from each layer
+    const extractedData = LayerDataExtractor.extractLayerData(ls);
+    setLayerData(extractedData);
+    console.log('Extracted layer data:', extractedData);
 
     const pi = ls.findIndex(x => x.type === "solderpaste");
     setPasteIdx(pi >= 0 ? pi : null);
@@ -527,13 +650,40 @@ export default function App() {
     // Always get fresh geometry from current viewBox
     const geom = getSvgGeom(); if (!geom) return;
 
-    // Helper to convert mm to current viewBox units
+    // Helper to convert mm to current viewBox units with coordinate correction
     const mmToCurrentUnits = (ptMm) => {
-      return {
+      // Check if Y-axis needs correction based on SVG coordinate system
+      const needsYCorrection = geom.minY < 0; // Common indicator of inverted Y-axis
+      
+      const result = {
         x: ptMm.x / geom.mmPerUnit + geom.minX,
-        y: ptMm.y / geom.mmPerUnit + geom.minY,
+        y: needsYCorrection ? 
+          (geom.minY + geom.vbH) - (ptMm.y / geom.mmPerUnit) : // Flip Y if needed
+          ptMm.y / geom.mmPerUnit + geom.minY,
         r: 1 / geom.mmPerUnit
       };
+      
+      console.log('mmToCurrentUnits conversion:', {
+        input: ptMm,
+        output: result,
+        needsYCorrection,
+        geom: { minX: geom.minX, minY: geom.minY, vbH: geom.vbH, mmPerUnit: geom.mmPerUnit }
+      });
+      
+      // Additional debug for coordinate verification
+      if (ptMm.x > 15 && ptMm.x < 25) { // Only log for pad-like coordinates
+        console.log('🎯 PAD COORDINATE CONVERSION:', {
+          inputMm: ptMm,
+          outputSvg: result,
+          calculation: {
+            x: `${ptMm.x} / ${geom.mmPerUnit} + ${geom.minX} = ${result.x}`,
+            y: needsYCorrection ? 
+              `(${geom.minY} + ${geom.vbH}) - (${ptMm.y} / ${geom.mmPerUnit}) = ${result.y}` :
+              `${ptMm.y} / ${geom.mmPerUnit} + ${geom.minY} = ${result.y}`
+          }
+        });
+      }
+      return result;
     };
 
     // Draw live preview overlays
@@ -640,6 +790,7 @@ export default function App() {
     // Draw reference point (origin or fiducial)
     const activeRef = referencePoint || selectedOrigin;
     if (activeRef) {
+      console.log('Drawing activeRef:', activeRef, 'coordinates:', { x: activeRef.x, y: activeRef.y });
       const uh = mmToCurrentUnits({ x: activeRef.x, y: activeRef.y });
       const isOrigin = activeRef === selectedOrigin;
       const color = isOrigin ? "#0a0" : "#ff6600";
@@ -649,13 +800,31 @@ export default function App() {
     }
 
     if (selectedMm) {
-      // Find the selected pad to draw border around it
-      const selectedPad = pads.find(p => Math.abs(p.x - selectedMm.x) < 0.1 && Math.abs(p.y - selectedMm.y) < 0.1);
+      // Find the selected pad using original coordinates (before transformation)
+      const origin = selectedOrigin;
+      let searchCoords = selectedMm;
+      
+      // If we have an origin, reverse the transformation to find the original pad
+      if (origin) {
+        searchCoords = {
+          x: selectedMm.x + origin.x, // Reverse: add back origin.x
+          y: selectedMm.y - origin.y  // Reverse: subtract back origin.y
+        };
+      }
+      
+      const selectedPad = pads.find(p => Math.abs(p.x - searchCoords.x) < 0.1 && Math.abs(p.y - searchCoords.y) < 0.1);
       if (selectedPad) {
         
-        // Use actual pad center coordinates from the pad object
-        const padCenter = { x: selectedPad.x, y: selectedPad.y };
-        const u = mmToCurrentUnits(padCenter);
+        // Use original pad coordinates for drawing the marker (not transformed coordinates)
+        const markerCoords = { x: selectedPad.x, y: selectedPad.y };
+        console.log('Drawing overlay for selected pad:', {
+          selectedMm,
+          selectedPad,
+          markerCoords,
+          centerMethod: selectedPad.centerMethod
+        });
+        const u = mmToCurrentUnits(markerCoords);
+        console.log('Converted to SVG units:', u);
         
         // Calculate marker radius based on actual pad dimensions
         const padWidth = selectedPad.width || 1.0;
@@ -676,15 +845,18 @@ export default function App() {
         circle.setAttribute("stroke-dasharray", "3,3");
         gm.appendChild(circle);
         
-        // Draw center crosshair at actual pad center
-        const crossSize = (maxDimension * 0.3) / geom.mmPerUnit;
+        // Enhanced center marking with validation indicator
+        const crossSize = (maxDimension * 0.4) / geom.mmPerUnit;
+        const centerColor = selectedPad.centerValid ? "#00ff00" : "#ff6600";
+        
+        // Main crosshair
         const hLine = document.createElementNS(NS, "line");
         hLine.setAttribute("x1", u.x - crossSize);
         hLine.setAttribute("y1", u.y);
         hLine.setAttribute("x2", u.x + crossSize);
         hLine.setAttribute("y2", u.y);
-        hLine.setAttribute("stroke", "#ff0000");
-        hLine.setAttribute("stroke-width", markerRadius * 0.06);
+        hLine.setAttribute("stroke", centerColor);
+        hLine.setAttribute("stroke-width", markerRadius * 0.08);
         gm.appendChild(hLine);
         
         const vLine = document.createElementNS(NS, "line");
@@ -692,17 +864,30 @@ export default function App() {
         vLine.setAttribute("y1", u.y - crossSize);
         vLine.setAttribute("x2", u.x);
         vLine.setAttribute("y2", u.y + crossSize);
-        vLine.setAttribute("stroke", "#ff0000");
-        vLine.setAttribute("stroke-width", markerRadius * 0.06);
+        vLine.setAttribute("stroke", centerColor);
+        vLine.setAttribute("stroke-width", markerRadius * 0.08);
         gm.appendChild(vLine);
         
-        // Add center dot for precise center indication
+        // Precise center dot with validation ring
         const centerDot = document.createElementNS(NS, "circle");
         centerDot.setAttribute("cx", u.x);
         centerDot.setAttribute("cy", u.y);
-        centerDot.setAttribute("r", markerRadius * 0.15);
-        centerDot.setAttribute("fill", "#ff0000");
+        centerDot.setAttribute("r", markerRadius * 0.2);
+        centerDot.setAttribute("fill", centerColor);
+        centerDot.setAttribute("stroke", "#ffffff");
+        centerDot.setAttribute("stroke-width", markerRadius * 0.05);
         gm.appendChild(centerDot);
+        
+        // Validation ring
+        const validationRing = document.createElementNS(NS, "circle");
+        validationRing.setAttribute("cx", u.x);
+        validationRing.setAttribute("cy", u.y);
+        validationRing.setAttribute("r", markerRadius * 0.35);
+        validationRing.setAttribute("fill", "none");
+        validationRing.setAttribute("stroke", centerColor);
+        validationRing.setAttribute("stroke-width", markerRadius * 0.04);
+        validationRing.setAttribute("stroke-dasharray", selectedPad.centerValid ? "none" : "2,2");
+        gm.appendChild(validationRing);
         
         // Draw paste visualization dots if enabled
         if (showPasteDots) {
@@ -938,7 +1123,15 @@ export default function App() {
     const local = pt.matrixTransform(ctm.inverse());
     const mmX = (local.x - geom.minX) * geom.mmPerUnit;
     const mmY = (local.y - geom.minY) * geom.mmPerUnit;
-    console.log('Click conversion:', { clientX: evt.clientX, clientY: evt.clientY, localX: local.x, localY: local.y, mmX, mmY });
+    console.log('Click conversion:', { 
+      clientX: evt.clientX, 
+      clientY: evt.clientY, 
+      localX: local.x, 
+      localY: local.y, 
+      mmX, 
+      mmY,
+      geom: { minX: geom.minX, minY: geom.minY, mmPerUnit: geom.mmPerUnit }
+    });
     return { x: mmX, y: mmY };
   };
 
@@ -948,20 +1141,41 @@ export default function App() {
       return null;
     }
     
+    let bestMatch = null;
+    let minDistance = Infinity;
+    
     for (let i = 0; i < pads.length; i++) {
       const pad = pads[i];
-      const halfWidth = Math.max((pad.width || 1) / 2, 0.5);
-      const halfHeight = Math.max((pad.height || 1) / 2, 0.5);
-      const tolerance = 0.3;
+      const halfWidth = (pad.width || 1) / 2;
+      const halfHeight = (pad.height || 1) / 2;
       
-      if (clickMm.x >= pad.x - halfWidth - tolerance && 
-          clickMm.x <= pad.x + halfWidth + tolerance &&
-          clickMm.y >= pad.y - halfHeight - tolerance && 
-          clickMm.y <= pad.y + halfHeight + tolerance) {
-        return { pad: i, pos: pad };
+      // Calculate distance from click to pad center
+      const distanceToCenter = Math.hypot(clickMm.x - pad.x, clickMm.y - pad.y);
+      
+      // Check if click is within pad boundaries
+      const withinBounds = clickMm.x >= pad.x - halfWidth && 
+                          clickMm.x <= pad.x + halfWidth &&
+                          clickMm.y >= pad.y - halfHeight && 
+                          clickMm.y <= pad.y + halfHeight;
+      
+      if (withinBounds && distanceToCenter < minDistance) {
+        minDistance = distanceToCenter;
+        bestMatch = { 
+          pad: i, 
+          pos: { 
+            x: pad.x, // Always use calculated center
+            y: pad.y, // Always use calculated center
+            width: pad.width,
+            height: pad.height,
+            centerValid: pad.centerValid,
+            centerMethod: pad.centerMethod
+          },
+          distanceToCenter
+        };
       }
     }
-    return null;
+    
+    return bestMatch;
   }
 
   const [dragFid, setDragFid] = useState(null);
@@ -1147,6 +1361,12 @@ export default function App() {
   const handleCanvasClick = useCallback((evt) => {
     if (fidPickMode) return;
 
+    // Debug coordinate conversion
+    const svgEl = getSvgEl();
+    if (svgEl) {
+      debugCoordinateConversion(evt, svgEl, null);
+    }
+
     const mm = getEventMm(evt);
     if (!mm) return;
     
@@ -1169,8 +1389,46 @@ export default function App() {
       return;
     }
 
-    // Always use pad center coordinates, not click coordinates
-    const padCenter = { x: hit.pos.x, y: hit.pos.y };
+    // Transform pad coordinates relative to origin
+    const origin = selectedOrigin;
+    let padCenter;
+    
+    if (origin) {
+      // Apply coordinate transformation: subtract origin.x from pad.x, add origin.y to pad.y
+      padCenter = {
+        x: hit.pos.x - origin.x,
+        y: hit.pos.y + origin.y,
+        centerValid: hit.pos.centerValid,
+        centerMethod: hit.pos.centerMethod
+      };
+      console.log('🔄 Coordinate transformation applied:', {
+        originalPad: { x: hit.pos.x, y: hit.pos.y },
+        origin: { x: origin.x, y: origin.y },
+        transformedPad: padCenter,
+        calculation: `x: ${hit.pos.x} - ${origin.x} = ${padCenter.x}, y: ${hit.pos.y} + ${origin.y} = ${padCenter.y}`
+      });
+    } else {
+      // No origin available, use original coordinates
+      padCenter = { 
+        x: hit.pos.x, 
+        y: hit.pos.y,
+        centerValid: hit.pos.centerValid,
+        centerMethod: hit.pos.centerMethod
+      };
+    }
+    
+    console.log('Pad selection details:', {
+      clickMm: mm,
+      hitPad: hit.pad,
+      hitPos: hit.pos,
+      padCenter,
+      distanceToCenter: hit.distanceToCenter
+    });
+    
+    // Validate center calculation
+    if (!hit.pos.centerValid) {
+      console.warn('Pad center calculation may be inaccurate:', hit.pos.centerMethod);
+    }
     
     // Show distance from reference point to clicked pad
     const refPoint = referencePoint || selectedOrigin;
@@ -1370,7 +1628,7 @@ export default function App() {
             <button className="btn secondary" onClick={() => changeSide("bottom")}>Bottom</button>
             <label><input type="checkbox" checked={mirrorBottom} onChange={(e) => setMirrorBottom(e.target.checked)} /> Mirror bottom</label>
           </div>
-          <LayerList layers={layers} onToggle={toggleLayer} />
+          <LayerList layers={layers} layerData={layerData} onToggle={toggleLayer} />
         </div>
 
 
@@ -1511,12 +1769,15 @@ export default function App() {
               <span>ΔY: {(selectedMm.y - (referencePoint || selectedOrigin).y).toFixed(2)} mm</span>
               <span><strong>2D: {Math.hypot(selectedMm.x - (referencePoint || selectedOrigin).x, selectedMm.y - (referencePoint || selectedOrigin).y).toFixed(2)} mm</strong></span>
               {generatedPath && <span>3D Path: {generatedPath.totalDistance.toFixed(2)} mm</span>}
+              <span style={{ color: selectedMm.centerValid ? '#28a745' : '#ffc107' }}>Center: ({selectedMm.x.toFixed(3)}, {selectedMm.y.toFixed(3)}) {selectedMm.centerValid ? '✓' : '⚠️'}</span>
+              {selectedMm.centerMethod && <span style={{ fontSize: '0.8em', color: '#666' }}>Method: {selectedMm.centerMethod}</span>}
             </div>
             <div className="path-controls" style={{ marginTop: 8 }}>
               <select value={pathType} onChange={(e) => setPathType(e.target.value)} style={{ fontSize: 12 }}>
                 <option value="direct">Direct Path</option>
                 <option value="safe">Safe Path (Lift)</option>
                 <option value="optimized">Optimized Path</option>
+                <option value="zigzag">Zig-Zag Path</option>
               </select>
               <label style={{ marginLeft: 8, fontSize: 12 }}>
                 <input type="checkbox" checked={showPasteDots} onChange={(e) => setShowPasteDots(e.target.checked)} />
@@ -1526,6 +1787,43 @@ export default function App() {
                 <small style={{ marginLeft: 8, color: '#666' }}>
                   {generatedPath.type} • {generatedPath.segments.length} segments
                 </small>
+              )}
+              {generatedPath && (
+                <div style={{ marginLeft: 8, marginTop: 4 }}>
+                  <button 
+                    className="btn sm secondary" 
+                    onClick={() => {
+                      // Validate center before generating G-code
+                      if (!selectedMm.centerValid) {
+                        const confirm = window.confirm(
+                          'Warning: Pad center calculation may be inaccurate.\n' +
+                          `Method: ${selectedMm.centerMethod}\n` +
+                          'Continue with G-code generation?'
+                        );
+                        if (!confirm) return;
+                      }
+                      
+                      const gcode = pathToDispensingGcode(generatedPath, { 
+                        feedRate: 1000, 
+                        safeHeight: 6, 
+                        dispensePressure: pressureSettings.customPressure || 25,
+                        dispenseTime: pressureSettings.customDwellTime || 120,
+                        targetCenter: { x: selectedMm.x, y: selectedMm.y },
+                        centerValid: selectedMm.centerValid
+                      });
+                      const blob = new Blob([gcode], { type: 'text/plain' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `${generatedPath.type}_center_dispense.gcode`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    style={{ fontSize: 10, padding: '2px 6px' }}
+                  >
+                    📥 Download G-code {selectedMm.centerValid ? '✓' : '⚠️'}
+                  </button>
+                </div>
               )}
             </div>
           </div>
@@ -1585,6 +1883,15 @@ export default function App() {
         )}
 
         <div className="panels">
+          <BatchPanel
+            batchProcessor={batchProcessor}
+            currentBatch={currentBatch}
+            onBatchSelect={handleBatchSelect}
+            onStartBatch={handleStartBatch}
+            onPauseBatch={handlePauseBatch}
+            onAddBoard={handleAddCurrentBoard}
+            onDeleteBatch={handleDeleteBatch}
+          />
           <LivePreview
             dispensingSequence={dispensingSequence}
             isJobRunning={livePreview.isActive}
@@ -1610,6 +1917,10 @@ export default function App() {
             onStartJob={(gcode, sequence) => {
               console.log('Starting automated dispensing job:', { gcode, sequence });
             }}
+            batchProcessor={batchProcessor}
+            currentBatch={currentBatch}
+            onStartBatch={handleStartBatch}
+            layerData={layerData}
           />
           <CameraPanel
             fiducials={fiducials}
@@ -1623,6 +1934,7 @@ export default function App() {
             padDetector={padDetector}
             qualityController={qualityController}
             fiducialVisionDetector={fiducialVisionDetector}
+            layerData={layerData}
           />
           <PressurePanel
             pressureController={pressureController}

@@ -16,10 +16,14 @@ export default function AutomatedDispensingPanel({
   setComponentHeights,
   safePathPlanner,
   onStartJob,
-  onDownloadGCode
+  onDownloadGCode,
+  batchProcessor,
+  currentBatch,
+  onStartBatch
 }) {
   const [isJobRunning, setIsJobRunning] = useState(false);
   const [currentPadIndex, setCurrentPadIndex] = useState(0);
+  const [jobMode, setJobMode] = useState('single'); // 'single' or 'batch'
 
   const refPoint = referencePoint || selectedOrigin;
 
@@ -184,16 +188,102 @@ export default function AutomatedDispensingPanel({
         </div>
       )}
 
+      {/* Job Mode Selection */}
+      <div className="box">
+        <h4>Job Mode</h4>
+        <div className="flex-row" style={{ gap: 16 }}>
+          <label>
+            <input 
+              type="radio" 
+              name="jobMode" 
+              value="single" 
+              checked={jobMode === 'single'}
+              onChange={(e) => setJobMode(e.target.value)}
+            />
+            Single Board
+          </label>
+          <label>
+            <input 
+              type="radio" 
+              name="jobMode" 
+              value="batch" 
+              checked={jobMode === 'batch'}
+              onChange={(e) => setJobMode(e.target.value)}
+            />
+            Batch Processing
+          </label>
+        </div>
+      </div>
+
+      {/* Batch Status */}
+      {jobMode === 'batch' && currentBatch && (
+        <div className="box">
+          <h4>Current Batch: {currentBatch.name}</h4>
+          <div className="grid2">
+            <div>
+              <strong>Total Boards:</strong> {currentBatch.totalBoards}
+            </div>
+            <div>
+              <strong>Completed:</strong> {currentBatch.completedBoards}
+            </div>
+            <div>
+              <strong>Failed:</strong> {currentBatch.failedBoards}
+            </div>
+            <div>
+              <strong>Status:</strong> 
+              <span style={{ 
+                color: currentBatch.status === 'completed' ? '#28a745' : 
+                       currentBatch.status === 'running' ? '#007bff' : 
+                       currentBatch.status === 'failed' ? '#dc3545' : '#6c757d'
+              }}>
+                {currentBatch.status.toUpperCase()}
+              </span>
+            </div>
+          </div>
+          {currentBatch.status === 'running' && (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ 
+                width: '100%', 
+                height: '6px', 
+                backgroundColor: '#e9ecef', 
+                borderRadius: '3px',
+                overflow: 'hidden'
+              }}>
+                <div style={{
+                  width: `${(currentBatch.completedBoards / currentBatch.totalBoards) * 100}%`,
+                  height: '100%',
+                  backgroundColor: '#007bff',
+                  transition: 'width 0.3s ease'
+                }} />
+              </div>
+              <small style={{ color: '#666', marginTop: '4px', display: 'block' }}>
+                Processing Board {currentBatch.currentBoardIndex + 1} of {currentBatch.totalBoards}
+              </small>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Job Controls */}
       <div className="controls">
-        <button 
-          className="btn" 
-          onClick={handleStartAutomatedJob}
-          disabled={!refPoint || dispensingSequence.length === 0 || isJobRunning}
-        >
-          {isJobRunning ? '🔄 Job Running...' : 
-           useSafePathPlanning ? '🛡️ Start Safe Dispensing Job' : '▶️ Start Automated Job'}
-        </button>
+        {jobMode === 'single' ? (
+          <button 
+            className="btn" 
+            onClick={handleStartAutomatedJob}
+            disabled={!refPoint || dispensingSequence.length === 0 || isJobRunning}
+          >
+            {isJobRunning ? '🔄 Job Running...' : 
+             useSafePathPlanning ? '🛡️ Start Safe Dispensing Job' : '▶️ Start Automated Job'}
+          </button>
+        ) : (
+          <button 
+            className="btn" 
+            onClick={() => currentBatch && onStartBatch && onStartBatch(currentBatch.id)}
+            disabled={!currentBatch || currentBatch.status === 'running' || currentBatch.boards.length === 0}
+          >
+            {currentBatch?.status === 'running' ? '🔄 Batch Running...' : '🚀 Start Batch Job'}
+          </button>
+        )}
         
         {isJobRunning && (
           <button className="btn secondary" onClick={handleStopJob}>
@@ -238,9 +328,21 @@ export default function AutomatedDispensingPanel({
       )}
 
       {/* Warnings */}
-      {!refPoint && (
+      {jobMode === 'single' && !refPoint && (
         <div className="collision-warning">
           <strong>⚠️ Setup Required:</strong> Please select a reference point (origin or fiducial) before starting automated dispensing.
+        </div>
+      )}
+      
+      {jobMode === 'batch' && !currentBatch && (
+        <div className="collision-warning">
+          <strong>⚠️ No Batch Selected:</strong> Please create and select a batch from the Batch Panel before starting batch processing.
+        </div>
+      )}
+      
+      {jobMode === 'batch' && currentBatch && currentBatch.boards.length === 0 && (
+        <div className="collision-warning">
+          <strong>⚠️ Empty Batch:</strong> Please add boards to the batch before starting batch processing.
         </div>
       )}
       

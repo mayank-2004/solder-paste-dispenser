@@ -58,12 +58,18 @@ function extractBounds(gerberText) {
     const xs = coords.map(c => c.x);
     const ys = coords.map(c => c.y);
     
-    return {
+    const bounds = {
       minX: Math.min(...xs),
       maxX: Math.max(...xs),
       minY: Math.min(...ys),
       maxY: Math.max(...ys)
     };
+    
+    console.log('Origin detection - extracted bounds:', bounds, 'from', coords.length, 'coordinates');
+    console.log('Sample coordinates:', coords.slice(0, 5));
+    console.log('Origin will be set to:', { x: bounds.minX, y: bounds.minY });
+    
+    return bounds;
   } catch (error) {
     console.warn('Error extracting bounds:', error);
     return null;
@@ -71,7 +77,7 @@ function extractBounds(gerberText) {
 }
 
 /**
- * Extract coordinates from Gerber text
+ * Extract coordinates from Gerber text using EXACT same logic as extractPads
  */
 function extractCoordinates(gerberText) {
   const paramBlocks = [];
@@ -85,11 +91,7 @@ function extractCoordinates(gerberText) {
     const mo = block.match(/%MO(IN|MM)\*%/i);
     if (mo) units = mo[1].toLowerCase() === 'in' ? 'in' : 'mm';
     const fs = block.match(/%FS([LT])([AI])X(\d)(\d)Y(\d)(\d)\*%/i);
-    if (fs) { 
-      zeroSupp = fs[1].toUpperCase(); 
-      xInt = +fs[3]; xDec = +fs[4]; 
-      yInt = +fs[5]; yDec = +fs[6]; 
-    }
+    if (fs) { zeroSupp = fs[1].toUpperCase(); xInt=+fs[3]; xDec=+fs[4]; yInt=+fs[5]; yDec=+fs[6]; }
   }
 
   const opsText = gerberText.replace(/%[^%]*%/g, '');
@@ -105,6 +107,15 @@ function extractCoordinates(gerberText) {
     return sign * parseFloat(`${s.slice(0,i)}.${s.slice(i)}`);
   };
 
+  const parseXY = (t, last) => {
+    const m = {};
+    t.replace(/([XY])([+\-]?\d+(?:\.\d+)?)?/gi, (_, k, v) => { m[k.toUpperCase()] = v || ''; return ''; });
+    let x = last.x, y = last.y;
+    if (m.X !== undefined) x = parseCoord(m.X, xInt, xDec);
+    if (m.Y !== undefined) y = parseCoord(m.Y, yInt, yDec);
+    return { x, y };
+  };
+
   const coords = [];
   let curX = 0, curY = 0;
 
@@ -113,22 +124,16 @@ function extractCoordinates(gerberText) {
     if (!t || /^G0?4/i.test(t)) continue;
 
     if (/[XY]/i.test(t)) {
-      const m = {};
-      t.replace(/([XY])([+\-]?\d+(?:\.\d+)?)?/gi, (_, k, v) => { 
-        m[k.toUpperCase()] = v || ''; 
-        return ''; 
-      });
-      
-      if (m.X !== undefined) curX = parseCoord(m.X, xInt, xDec);
-      if (m.Y !== undefined) curY = parseCoord(m.Y, yInt, yDec);
-      
-      const xMm = units === 'in' ? curX * IN2MM : curX;
-      const yMm = units === 'in' ? curY * IN2MM : curY;
-      
-      coords.push({ x: xMm, y: yMm });
+      const { x, y } = parseXY(t, { x: curX, y: curY });
+      curX = x; curY = y;
+      coords.push({ x, y });
     }
   }
 
+  // Apply unit conversion at the end, same as extractPads
+  if (units === 'in') {
+    return coords.map(c => ({ x: c.x * IN2MM, y: c.y * IN2MM }));
+  }
   return coords;
 }
 

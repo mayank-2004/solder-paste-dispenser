@@ -87,6 +87,28 @@ body {
   font-size: 12px;
 }
 
+.btn.primary {
+  background: #007bff;
+  color: white;
+  border-color: #007bff;
+}
+
+.btn.primary:hover {
+  background: #0056b3;
+  border-color: #0056b3;
+}
+
+.btn.warning {
+  background: #ffc107;
+  color: #212529;
+  border-color: #ffc107;
+}
+
+.btn.warning:hover {
+  background: #e0a800;
+  border-color: #d39e00;
+}
+
 .btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
@@ -407,4 +429,124 @@ pre {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+/* Batch Panel Styles */
+.batch-list {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid #e9ecef;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.batch-item {
+  padding: 12px;
+  padding-right: 40px; /* Extra space for delete button */
+  border-bottom: 1px solid #f1f3f4;
+  cursor: pointer;
+  transition: background-color 0.2s;
+  position: relative;
+  min-height: 60px; /* Ensure minimum height for button */
+}
+
+.batch-item:hover {
+  background-color: #f8f9fa;
+}
+
+.batch-item.selected {
+  background-color: #e3f2fd;
+  border-left: 3px solid #2196f3;
+}
+
+.batch-item .delete-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: #dc3545;
+  color: white;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.7;
+  transition: opacity 0.2s, background-color 0.2s;
+}
+
+.batch-item .delete-btn:hover:not(:disabled) {
+  opacity: 1;
+  background: #c82333;
+}
+
+.batch-item .delete-btn:disabled {
+  background: #6c757d;
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.batch-item:last-child {
+  border-bottom: none;
+}
+
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 0.75em;
+  font-weight: 600;
+  color: white;
+  text-transform: uppercase;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 4px;
+  background-color: #e9ecef;
+  border-radius: 2px;
+  overflow: hidden;
+  margin: 8px 0 4px 0;
+}
+
+.progress-bar .progress-fill {
+  height: 100%;
+  background-color: #007bff;
+  transition: width 0.3s ease;
+}
+
+.batch-controls {
+  margin-top: 12px;
+  padding: 12px;
+  background: #f8f9fa;
+  border-radius: 4px;
+  border: 1px solid #e9ecef;
+}
+
+.form-group {
+  margin-bottom: 12px;
+}
+
+.form-group input {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid #e9ecef;
+}
+
+.panel-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: #343a40;
 }

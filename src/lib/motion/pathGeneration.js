@@ -4,8 +4,8 @@
 export function generatePath(origin, target, pads, options = {}) {
   const {
     avoidPads = true,
-    safeHeight = 2, // mm above PCB
-    pathType = 'direct' // 'direct', 'safe', 'optimized'
+    safeHeight = 6, // mm above PCB
+    pathType = 'direct' // 'direct', 'safe', 'optimized', 'zigzag'
   } = options;
 
   if (!origin || !target) return null;
@@ -26,6 +26,9 @@ export function generatePath(origin, target, pads, options = {}) {
     
     case 'optimized':
       return generateOptimizedPath(origin, target, pads, safeHeight);
+    
+    case 'zigzag':
+      return generateZigzagPath(origin, target, options);
     
     default:
       return generateDirectPath(origin, target);
@@ -228,4 +231,102 @@ function isPointNearLine(lineStart, lineEnd, point, threshold) {
 
   const distance = Math.hypot(point.x - xx, point.y - yy);
   return distance <= threshold;
+}
+
+/**
+ * Generate zig-zag path with incremental X and Y movements
+ */
+function generateZigzagPath(origin, target, options = {}) {
+  const {
+    stepSize = 2, // mm per step
+    pattern = 'xy' // 'xy', 'yx', 'alternating'
+  } = options;
+
+  const dx = target.x - origin.x;
+  const dy = target.y - origin.y;
+  const points = [{ x: origin.x, y: origin.y, z: 0, type: 'start' }];
+  
+  let currentX = origin.x;
+  let currentY = origin.y;
+  
+  if (pattern === 'xy') {
+    // Move X first, then Y
+    const xSteps = Math.ceil(Math.abs(dx) / stepSize);
+    const ySteps = Math.ceil(Math.abs(dy) / stepSize);
+    const xStepSize = dx / xSteps;
+    const yStepSize = dy / ySteps;
+    
+    // X movement steps
+    for (let i = 1; i <= xSteps; i++) {
+      currentX = origin.x + (xStepSize * i);
+      points.push({ x: currentX, y: currentY, z: 0, type: 'step' });
+    }
+    
+    // Y movement steps
+    for (let i = 1; i <= ySteps; i++) {
+      currentY = origin.y + (yStepSize * i);
+      points.push({ x: currentX, y: currentY, z: 0, type: 'step' });
+    }
+  } else if (pattern === 'yx') {
+    // Move Y first, then X
+    const xSteps = Math.ceil(Math.abs(dx) / stepSize);
+    const ySteps = Math.ceil(Math.abs(dy) / stepSize);
+    const xStepSize = dx / xSteps;
+    const yStepSize = dy / ySteps;
+    
+    // Y movement steps
+    for (let i = 1; i <= ySteps; i++) {
+      currentY = origin.y + (yStepSize * i);
+      points.push({ x: currentX, y: currentY, z: 0, type: 'step' });
+    }
+    
+    // X movement steps
+    for (let i = 1; i <= xSteps; i++) {
+      currentX = origin.x + (xStepSize * i);
+      points.push({ x: currentX, y: currentY, z: 0, type: 'step' });
+    }
+  } else if (pattern === 'alternating') {
+    // Alternating X and Y steps (true zig-zag)
+    const totalDistance = Math.hypot(dx, dy);
+    const totalSteps = Math.ceil(totalDistance / stepSize);
+    
+    for (let i = 1; i <= totalSteps; i++) {
+      const progress = i / totalSteps;
+      
+      if (i % 2 === 1) {
+        // Odd steps: move in X direction
+        const xProgress = Math.min(progress * 2, 1);
+        currentX = origin.x + (dx * xProgress);
+      } else {
+        // Even steps: move in Y direction
+        const yProgress = Math.min((progress - 0.5) * 2, 1);
+        currentY = origin.y + (dy * yProgress);
+      }
+      
+      points.push({ x: currentX, y: currentY, z: 0, type: 'step' });
+    }
+  }
+  
+  // Ensure we end at the exact target
+  points.push({ x: target.x, y: target.y, z: 0, type: 'end' });
+  
+  // Generate segments
+  const segments = [];
+  let totalDistance = 0;
+  
+  for (let i = 0; i < points.length - 1; i++) {
+    const start = points[i];
+    const end = points[i + 1];
+    const distance = Math.hypot(end.x - start.x, end.y - start.y);
+    
+    segments.push({ start, end, type: 'step', distance });
+    totalDistance += distance;
+  }
+  
+  return {
+    points,
+    segments,
+    totalDistance,
+    type: 'zigzag'
+  };
 }
