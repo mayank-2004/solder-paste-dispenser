@@ -44,49 +44,19 @@ import BatchPanel from "./components/BatchPanel.jsx";
 
 
 function calculatePadCenter(p) {
-  console.log('Processing pad for center:', p);
-  
-  // Validate input
-  if (!p || typeof p !== 'object') {
-    console.warn('Invalid pad object:', p);
-    return { x: 0, y: 0, valid: false, method: 'fallback' };
-  }
-  
-  // Method 1: Explicit center coordinates
-  if (typeof p.cx === "number" && typeof p.cy === "number") {
-    console.log('Using explicit cx/cy:', { x: p.cx, y: p.cy });
-    return { x: p.cx, y: p.cy, valid: true, method: 'explicit_center' };
-  }
-  
-  // Method 2: Center with width/height for validation
-  if (typeof p.x === "number" && typeof p.y === "number" && 
-      typeof p.width === "number" && typeof p.height === "number") {
-    
-    const isTopLeft = p.origin === "topleft" || p.topLeft === true || p.anchor === "tl";
-    const isBottomLeft = p.origin === "bottomleft" || p.anchor === "bl";
-    const isCenter = !isTopLeft && !isBottomLeft;
-    
-    let center;
-    if (isTopLeft) {
-      center = { x: p.x + p.width / 2, y: p.y + p.height / 2 };
-    } else if (isBottomLeft) {
-      center = { x: p.x + p.width / 2, y: p.y - p.height / 2 };
-    } else {
-      // Assume center coordinates
-      center = { x: p.x, y: p.y };
-    }
-    
-    console.log('Calculated center with validation:', center, 'method:', isTopLeft ? 'topleft' : isBottomLeft ? 'bottomleft' : 'center');
-    return { ...center, valid: true, method: isTopLeft ? 'topleft_calc' : isBottomLeft ? 'bottomleft_calc' : 'center_assumed', width: p.width, height: p.height };
-  }
-  
-  // Method 3: Basic x/y coordinates (assume center)
+  // For Gerber-extracted pads, x,y coordinates ARE the center (flash coordinates)
   if (typeof p.x === "number" && typeof p.y === "number") {
-    console.log('Using x/y as center (no dimensions):', { x: p.x, y: p.y });
-    return { x: p.x, y: p.y, valid: true, method: 'xy_assumed', width: p.width || 1, height: p.height || 1 };
+    return { 
+      x: p.x, 
+      y: p.y, 
+      valid: true, 
+      method: 'gerber_flash_center',
+      width: p.width || 1, 
+      height: p.height || 1 
+    };
   }
   
-  console.warn('No valid coordinates found, using fallback:', { x: 0, y: 0 });
+  // Fallback for invalid data
   return { x: 0, y: 0, valid: false, method: 'fallback' };
 }
 
@@ -133,14 +103,7 @@ export default function App() {
   const [generatedPath, setGeneratedPath] = useState(null);
   const [pathType, setPathType] = useState('direct'); // 'direct', 'safe', 'optimized'
 
-  const [zoomState, setZoomState] = useState({ 
-    enabled: false, 
-    isZoomed: false, 
-    baseViewBox: null, 
-    zoomLevel: 0, // 0 = normal, 1 = 2x, 2 = 4x, 3 = 8x
-    maxZoomLevel: 3,
-    zoomPadding: 2 
-  });
+
 
   const [fidPickMode, setFidPickMode] = useState(false);
   const [fidActiveId, setFidActiveId] = useState(null);
@@ -523,7 +486,6 @@ export default function App() {
     await rebuild(ls, side);
 
     setSelectedMm(null);
-    setZoomState(z => ({ ...z, isZoomed: false, baseViewBox: null }));
     setXf(null); setApplyXf(false);
     setFidPickMode(false); setFidActiveId(null);
     // Don't clear origin candidates and selectedOrigin here - they were just set above
@@ -546,7 +508,6 @@ export default function App() {
     saveStateForUndo(`Change side to ${s}`);
     setSide(s);
     await rebuild(layers, s);
-    setZoomState(z => ({ ...z, isZoomed: false }));
   };
 
   async function exportAllSvgsZip() {
@@ -650,39 +611,19 @@ export default function App() {
     // Always get fresh geometry from current viewBox
     const geom = getSvgGeom(); if (!geom) return;
 
-    // Helper to convert mm to current viewBox units with coordinate correction
+    // Helper to convert mm to current viewBox units with consistent coordinate system
     const mmToCurrentUnits = (ptMm) => {
-      // Check if Y-axis needs correction based on SVG coordinate system
-      const needsYCorrection = geom.minY < 0; // Common indicator of inverted Y-axis
-      
       const result = {
         x: ptMm.x / geom.mmPerUnit + geom.minX,
-        y: needsYCorrection ? 
-          (geom.minY + geom.vbH) - (ptMm.y / geom.mmPerUnit) : // Flip Y if needed
-          ptMm.y / geom.mmPerUnit + geom.minY,
+        y: ptMm.y / geom.mmPerUnit + geom.minY,
         r: 1 / geom.mmPerUnit
       };
       
       console.log('mmToCurrentUnits conversion:', {
         input: ptMm,
         output: result,
-        needsYCorrection,
-        geom: { minX: geom.minX, minY: geom.minY, vbH: geom.vbH, mmPerUnit: geom.mmPerUnit }
+        geom: { minX: geom.minX, minY: geom.minY, mmPerUnit: geom.mmPerUnit }
       });
-      
-      // Additional debug for coordinate verification
-      if (ptMm.x > 15 && ptMm.x < 25) { // Only log for pad-like coordinates
-        console.log('🎯 PAD COORDINATE CONVERSION:', {
-          inputMm: ptMm,
-          outputSvg: result,
-          calculation: {
-            x: `${ptMm.x} / ${geom.mmPerUnit} + ${geom.minX} = ${result.x}`,
-            y: needsYCorrection ? 
-              `(${geom.minY} + ${geom.vbH}) - (${ptMm.y} / ${geom.mmPerUnit}) = ${result.y}` :
-              `${ptMm.y} / ${geom.mmPerUnit} + ${geom.minY} = ${result.y}`
-          }
-        });
-      }
       return result;
     };
 
@@ -849,39 +790,42 @@ export default function App() {
         const crossSize = (maxDimension * 0.4) / geom.mmPerUnit;
         const centerColor = selectedPad.centerValid ? "#00ff00" : "#ff6600";
         
-        // Main crosshair
+        // Use yellow line endpoint coordinates for crosshair alignment
+        const yellowLineEndpoint = mmToCurrentUnits(selectedMm);
+        
+        // Main crosshair - using exact yellow line coordinates
         const hLine = document.createElementNS(NS, "line");
-        hLine.setAttribute("x1", u.x - crossSize);
-        hLine.setAttribute("y1", u.y);
-        hLine.setAttribute("x2", u.x + crossSize);
-        hLine.setAttribute("y2", u.y);
+        hLine.setAttribute("x1", yellowLineEndpoint.x - crossSize);
+        hLine.setAttribute("y1", yellowLineEndpoint.y);
+        hLine.setAttribute("x2", yellowLineEndpoint.x + crossSize);
+        hLine.setAttribute("y2", yellowLineEndpoint.y);
         hLine.setAttribute("stroke", centerColor);
         hLine.setAttribute("stroke-width", markerRadius * 0.08);
         gm.appendChild(hLine);
         
         const vLine = document.createElementNS(NS, "line");
-        vLine.setAttribute("x1", u.x);
-        vLine.setAttribute("y1", u.y - crossSize);
-        vLine.setAttribute("x2", u.x);
-        vLine.setAttribute("y2", u.y + crossSize);
+        vLine.setAttribute("x1", yellowLineEndpoint.x);
+        vLine.setAttribute("y1", yellowLineEndpoint.y - crossSize);
+        vLine.setAttribute("x2", yellowLineEndpoint.x);
+        vLine.setAttribute("y2", yellowLineEndpoint.y + crossSize);
         vLine.setAttribute("stroke", centerColor);
         vLine.setAttribute("stroke-width", markerRadius * 0.08);
         gm.appendChild(vLine);
         
-        // Precise center dot with validation ring
+        // Precise center dot with validation ring - using exact yellow line coordinates
         const centerDot = document.createElementNS(NS, "circle");
-        centerDot.setAttribute("cx", u.x);
-        centerDot.setAttribute("cy", u.y);
+        centerDot.setAttribute("cx", yellowLineEndpoint.x);
+        centerDot.setAttribute("cy", yellowLineEndpoint.y);
         centerDot.setAttribute("r", markerRadius * 0.2);
         centerDot.setAttribute("fill", centerColor);
         centerDot.setAttribute("stroke", "#ffffff");
         centerDot.setAttribute("stroke-width", markerRadius * 0.05);
         gm.appendChild(centerDot);
         
-        // Validation ring
+        // Validation ring - using exact yellow line coordinates
         const validationRing = document.createElementNS(NS, "circle");
-        validationRing.setAttribute("cx", u.x);
-        validationRing.setAttribute("cy", u.y);
+        validationRing.setAttribute("cx", yellowLineEndpoint.x);
+        validationRing.setAttribute("cy", yellowLineEndpoint.y);
         validationRing.setAttribute("r", markerRadius * 0.35);
         validationRing.setAttribute("fill", "none");
         validationRing.setAttribute("stroke", centerColor);
@@ -1233,9 +1177,6 @@ export default function App() {
     return () => obs.disconnect();
   }, [svg, updateOverlay]);
 
-  useEffect(() => {
-    updateOverlay();
-  }, [zoomState.isZoomed, updateOverlay]);
 
   // Update overlay when origin changes
   useEffect(() => {
@@ -1246,117 +1187,6 @@ export default function App() {
   }, [selectedOrigin, updateOverlay]);
 
 
-  const smoothZoom = useCallback((fromViewBox, toViewBox, duration = 300) => {
-    const svgEl = getSvgEl(); if (!svgEl) return;
-    
-    const startTime = performance.now();
-    const animate = (currentTime) => {
-      const elapsed = currentTime - startTime;
-      const progress = Math.min(elapsed / duration, 1);
-      
-      // Smooth easing function
-      const easeProgress = 1 - Math.pow(1 - progress, 3);
-      
-      const currentViewBox = {
-        minX: fromViewBox.minX + (toViewBox.minX - fromViewBox.minX) * easeProgress,
-        minY: fromViewBox.minY + (toViewBox.minY - fromViewBox.minY) * easeProgress,
-        w: fromViewBox.w + (toViewBox.w - fromViewBox.w) * easeProgress,
-        h: fromViewBox.h + (toViewBox.h - fromViewBox.h) * easeProgress
-      };
-      
-      svgEl.setAttribute("viewBox", `${currentViewBox.minX} ${currentViewBox.minY} ${currentViewBox.w} ${currentViewBox.h}`);
-      
-      if (progress < 1) {
-        requestAnimationFrame(animate);
-      } else {
-        updateOverlay();
-      }
-    };
-    
-    requestAnimationFrame(animate);
-  }, [getSvgEl, updateOverlay]);
-
-  const zoomToComponent = useCallback((ptMm) => {
-    const svgEl = getSvgEl(); if (!svgEl) return;
-    const viewBoxAttr = svgEl.getAttribute("viewBox"); if (!viewBoxAttr) return;
-    const [minX, minY, w, h] = viewBoxAttr.split(/\s+/).map(Number);
-    const currentViewBox = { minX, minY, w, h };
-    
-    if (!zoomState.baseViewBox) {
-      setZoomState(prev => ({ ...prev, baseViewBox: currentViewBox }));
-    }
-
-    const geom = getSvgGeom(); if (!geom) return;
-    const cx = ptMm.x / geom.mmPerUnit + geom.minX;
-    const cy = ptMm.y / geom.mmPerUnit + geom.minY;
-
-    const nextZoomLevel = Math.min(zoomState.zoomLevel + 1, zoomState.maxZoomLevel);
-    const zoomFactor = Math.pow(2, nextZoomLevel); // 2x, 4x, 8x
-    
-    const paddingUnits = zoomState.zoomPadding / geom.mmPerUnit;
-    const cont = getCanvas();
-    const ar = (cont?.clientWidth || 1) / (cont?.clientHeight || 1);
-    const baseViewBox = zoomState.baseViewBox || currentViewBox;
-    
-    let newW = (baseViewBox.w / zoomFactor) + paddingUnits * 2;
-    let newH = newW / ar;
-    
-    let newMinX = Math.max(Math.min(cx - newW / 2, baseViewBox.minX + baseViewBox.w - newW), baseViewBox.minX);
-    let newMinY = Math.max(Math.min(cy - newH / 2, baseViewBox.minY + baseViewBox.h - newH), baseViewBox.minY);
-    
-    const targetViewBox = { minX: newMinX, minY: newMinY, w: newW, h: newH };
-    
-    smoothZoom(currentViewBox, targetViewBox);
-    setZoomState(prev => ({ ...prev, isZoomed: true, zoomLevel: nextZoomLevel }));
-  }, [getSvgEl, getSvgGeom, zoomState.baseViewBox, zoomState.zoomLevel, zoomState.maxZoomLevel, zoomState.zoomPadding, getCanvas, smoothZoom]);
-
-  const zoomOut = useCallback(() => {
-    const svgEl = getSvgEl(); if (!svgEl) return;
-    
-    if (zoomState.zoomLevel > 0) {
-      // Step back one zoom level
-      const viewBoxAttr = svgEl.getAttribute("viewBox");
-      if (!viewBoxAttr) return;
-      const [minX, minY, w, h] = viewBoxAttr.split(/\s+/).map(Number);
-      const currentViewBox = { minX, minY, w, h };
-      
-      const prevZoomLevel = zoomState.zoomLevel - 1;
-      const baseViewBox = zoomState.baseViewBox;
-      if (!baseViewBox) return;
-      
-      let targetViewBox;
-      if (prevZoomLevel === 0) {
-        // Back to original view
-        targetViewBox = baseViewBox;
-      } else {
-        // Calculate intermediate zoom level
-        const zoomFactor = Math.pow(2, prevZoomLevel);
-        const paddingUnits = zoomState.zoomPadding / (getSvgGeom()?.mmPerUnit || 1);
-        const cont = getCanvas();
-        const ar = (cont?.clientWidth || 1) / (cont?.clientHeight || 1);
-        
-        const centerX = currentViewBox.minX + currentViewBox.w / 2;
-        const centerY = currentViewBox.minY + currentViewBox.h / 2;
-        
-        let newW = (baseViewBox.w / zoomFactor) + paddingUnits * 2;
-        let newH = newW / ar;
-        
-        targetViewBox = {
-          minX: Math.max(Math.min(centerX - newW / 2, baseViewBox.minX + baseViewBox.w - newW), baseViewBox.minX),
-          minY: Math.max(Math.min(centerY - newH / 2, baseViewBox.minY + baseViewBox.h - newH), baseViewBox.minY),
-          w: newW,
-          h: newH
-        };
-      }
-      
-      smoothZoom(currentViewBox, targetViewBox);
-      setZoomState(prev => ({ 
-        ...prev, 
-        isZoomed: prevZoomLevel > 0, 
-        zoomLevel: prevZoomLevel 
-      }));
-    }
-  }, [getSvgEl, zoomState.baseViewBox, zoomState.zoomLevel, zoomState.zoomPadding, getCanvas, getSvgGeom, smoothZoom]);
 
   const handleCanvasClick = useCallback((evt) => {
     if (fidPickMode) return;
@@ -1379,15 +1209,6 @@ export default function App() {
       return;
     }
 
-    if (zoomState.enabled) {
-      setSelectedMm(hit.pos);
-      if (zoomState.zoomLevel < zoomState.maxZoomLevel) {
-        zoomToComponent(hit.pos);
-      } else {
-        zoomOut();
-      }
-      return;
-    }
 
     // Transform pad coordinates relative to origin
     const origin = selectedOrigin;
@@ -1452,12 +1273,9 @@ export default function App() {
     }
   }, [
     fidPickMode,
-    zoomState.enabled, zoomState.isZoomed,
     selectedOrigin,
     pads,
-    getEventMm,
-    zoomToComponent,
-    zoomOut
+    getEventMm
   ]);
 
   const onInputMachine = (id, partial) => {
@@ -1755,10 +1573,6 @@ export default function App() {
           mirrorBottom={mirrorBottom}
           side={side}
           onClickSvg={handleCanvasClick}
-          zoomEnabled={zoomState.enabled}
-          isZoomed={zoomState.isZoomed}
-          onToggleZoom={() => setZoomState(z => ({ ...z, enabled: !z.enabled }))}
-          onZoomOut={zoomOut}
         />
 
         {(referencePoint || selectedOrigin) && selectedMm && (
