@@ -9,23 +9,64 @@ export function extractPadsMm(gerberText) {
   let xInt = 2, xDec = 4, yInt = 2, yDec = 4;
   const apertures = {};
 
+  const macros = {}; // Store aperture macros
+  
   for (const block of paramBlocks) {
     const mo = block.match(/%MO(IN|MM)\*%/i);
     if (mo) units = mo[1].toLowerCase() === 'in' ? 'in' : 'mm';
     const fs = block.match(/%FS([LT])([AI])X(\d)(\d)Y(\d)(\d)\*%/i);
     if (fs) { zeroSupp = fs[1].toUpperCase(); xInt=+fs[3]; xDec=+fs[4]; yInt=+fs[5]; yDec=+fs[6]; }
     
-    // Parse aperture definitions
-    const ad = block.match(/%ADD(\d+)([CR]),([\.\d]+)(?:X([\d\.]+))?\*%/i);
+    // Parse aperture macros (like OUTLINE2, OUTLINE5)
+    const macro = block.match(/%AM([A-Z0-9]+)\*([\s\S]*?)\*%/i);
+    if (macro) {
+      const macroName = macro[1];
+      const macroContent = macro[2];
+      // Extract approximate dimensions from macro content
+      const coords = macroContent.match(/([+-]?\d*\.?\d+)/g) || [];
+      const numbers = coords.map(parseFloat).filter(n => !isNaN(n) && n !== 0);
+      
+      let width = 1.5, height = 1.7; // Default sizes
+      if (numbers.length >= 4) {
+        const xCoords = numbers.filter((_, i) => i % 2 === 0);
+        const yCoords = numbers.filter((_, i) => i % 2 === 1);
+        width = Math.max(...xCoords) - Math.min(...xCoords);
+        height = Math.max(...yCoords) - Math.min(...yCoords);
+      }
+      
+      macros[macroName] = { width, height, shape: 'MACRO' };
+      console.log(`✅ Parsed macro ${macroName}:`, macros[macroName]);
+    }
+    
+    // Parse standard aperture definitions
+    let ad = block.match(/%ADD(\d+)([CR]),([\.\d]+)(?:X([\d\.]+))?\*%/i);
+    if (!ad) ad = block.match(/%ADD(\d+)([CR])([\.\d]+)(?:X([\d\.]+))?\*%/i);
+    if (!ad) ad = block.match(/%ADD(\d+)([A-Z0-9]+)\*%/i); // Macro reference
+    
     if (ad) {
-      const [, dCode, shape, size1, size2] = ad;
-      const s1 = parseFloat(size1);
-      const s2 = size2 ? parseFloat(size2) : s1;
-      apertures[parseInt(dCode)] = {
-        shape: shape.toUpperCase(),
-        width: shape === 'C' ? s1 : s1, // Circle: diameter, Rectangle: width
-        height: shape === 'C' ? s1 : s2 // Circle: diameter, Rectangle: height
-      };
+      const dCode = parseInt(ad[1]);
+      const shapeOrMacro = ad[2].toUpperCase();
+      
+      let aperture;
+      if (macros[shapeOrMacro]) {
+        // Use macro dimensions
+        aperture = { ...macros[shapeOrMacro] };
+      } else if (shapeOrMacro === 'C' || shapeOrMacro === 'R') {
+        // Standard circle/rectangle
+        const size1 = parseFloat(ad[3] || '1');
+        const size2 = ad[4] ? parseFloat(ad[4]) : size1;
+        aperture = {
+          shape: shapeOrMacro,
+          width: shapeOrMacro === 'C' ? size1 : size1,
+          height: shapeOrMacro === 'C' ? size1 : size2
+        };
+      } else {
+        // Unknown macro, use reasonable defaults
+        aperture = { width: 1.5, height: 1.7, shape: 'MACRO' };
+      }
+      
+      apertures[dCode] = aperture;
+      console.log(`✅ Parsed aperture D${dCode}:`, aperture, 'from:', block);
     }
   }
 
@@ -51,30 +92,34 @@ export function extractPadsMm(gerberText) {
     return { x, y };
   };
 
-  let curX = 0, curY = 0, currentD = null;
+  let curX = 0, curY = 0, currentD = null, currentAperture = null;
   const pads = [];
+
+  console.log('Available apertures:', apertures);
 
   for (const raw of tokens) {
     const t = raw.replace(/\s+/g, '');
     if (!t || /^G0?4/i.test(t)) continue;
 
     const md = t.match(/D0?(\d+)$/i);
-    if (md) currentD = +md[1];
+    if (md) {
+      currentD = +md[1];
+      // Update current aperture when D-code changes
+      if (currentD >= 10 && apertures[currentD]) {
+        currentAperture = apertures[currentD];
+        console.log(`Switched to aperture D${currentD}:`, currentAperture);
+      }
+    }
 
     if (/[XY]/i.test(t)) {
       const { x, y } = parseXY(t, { x: curX, y: curY });
       if (currentD === 2 || currentD == null) { curX=x; curY=y; continue; }
       if (currentD === 1) { curX=x; curY=y; continue; }
       if (currentD === 3) { // FLASH
-        // Find aperture for current D-code, fallback to reasonable defaults
-        let aperture = null;
-        for (const [dCode, apt] of Object.entries(apertures)) {
-          if (parseInt(dCode) >= 10) { // Skip D01, D02, D03 codes
-            aperture = apt;
-            break;
-          }
-        }
-        if (!aperture) aperture = { width: 1.0, height: 1.0, shape: 'C' };
+        // Use current active aperture or fallback
+        let aperture = currentAperture || { width: 1.0, height: 1.0, shape: 'R' };
+        
+        console.log(`Flash at (${x}, ${y}) with aperture:`, aperture);
         
         pads.push({ 
           x, 
